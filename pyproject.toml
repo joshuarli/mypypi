@@ -1,0 +1,40 @@
+[build-system]
+requires = ["uv_build>=0.13.4,<0.14"]
+build-backend = "uv_build"
+
+[project]
+name = "mypypi"
+version = "0.1.0"
+description = "Build and publish validated Python wheels to a local index"
+requires-python = ">=3.15,<3.16"
+dependencies = ["packaging>=26.3"]
+
+[project.scripts]
+mypypi = "mypypi.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=9.1.1", "ruff>=0.17.1"]
+
+[tool.uv]
+default-groups = ["dev"]
+
+[tool.mypypi.targets]
+platforms = ["linux-x86_64", "linux-aarch64", "macos-x86_64", "macos-arm64"]
+linux_repair_policy = "manylinux_2_28"
+
+[tool.mypypi.targets.linux_builder_images]
+"linux-x86_64" = { tag = "quay.io/pypa/manylinux_2_28_x86_64:2026.10.21-1", digest = "sha256:b74a5b6f1705ecff17be8bd792589bef9b3b039766d12205720ecd2a9e919192" }
+"linux-aarch64" = { tag = "quay.io/pypa/manylinux_2_28_aarch64:2026.10.21-1", digest = "sha256:0333f44c4eb759ec8f47b27bc9dc27b1c929932a267cf13ce0cff1a4b758cccb" }
+
+[tool.uv.build-backend]
+source-exclude = [".work/**"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py315"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
