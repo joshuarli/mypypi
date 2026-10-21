@@ -4,17 +4,27 @@ import argparse
 import hashlib
 import json
 import re
+import shutil
 import stat
 import sys
-from collections.abc import Sequence
+import sysconfig
+import tempfile
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from pathlib import Path
-from urllib.parse import urlsplit
 
 from packaging.version import Version
 
-from .acquire import Release, compatible_wheels, fetch_release
+from .acquire import (
+    CompatibilityRejection,
+    Release,
+    compatible_wheels,
+    fetch_release,
+    validate_wheel_architectures,
+    validate_wheel_metadata,
+)
 from .add import add_packages
-from .build import build_from_sdist, require_native_target, select_or_download
+from .build import acquire_or_build, require_native_target, validate_build_index
 from .catalog import Catalog, PackageEntry, parse_catalog
 from .config import ProjectSettings, load_project_settings
 from .models import (
@@ -34,17 +44,48 @@ from .models import (
     ValidatedArtifact,
     WheelIdentity,
 )
-from .planner import ArtifactKey, ArtifactRecord, UpstreamSdist, UpstreamWheel, plan
-from .platforms import ordered_target_tags
+from .planner import (
+    ArtifactKey,
+    ArtifactRecord,
+    UpstreamSdist,
+    UpstreamWheel,
+    plan,
+    validate_catalog_targets,
+)
+from .platforms import ordered_target_tags, target_python_version
 from .store import publish
+from .store import published_artifacts as read_published_artifacts
 from .validate import (
     ExceptionKind,
     ValidationException,
     ValidationPolicy,
+    _local_platform,
+    inspect_wheel,
     validate_wheels,
 )
 
 _DEFAULT_BUILD_INDEX = "https://pypi.org/simple"
+
+
+def _runtime_description(settings: ProjectSettings) -> str:
+    actual = Version(
+        f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+    )
+    if sys.implementation.name != "cpython" or not settings.python_specifier.contains(
+        str(actual), prereleases=True
+    ):
+        raise _error(
+            ErrorKind.CONFIGURATION,
+            f"mypypi requires CPython {settings.python_version}; running "
+            f"{sys.implementation.name} {actual}",
+            FailureStage.CONFIGURATION,
+        )
+    abi = sys.implementation.cache_tag
+    platform_tag = sysconfig.get_platform()
+    return (
+        f"using CPython {actual} ABI {abi} on {platform_tag}; "
+        f"executable {Path(sys.executable).resolve()}"
+    )
 def create_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="mypypi",
@@ -52,6 +93,7 @@ def create_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--catalog", type=Path, default=Path("packages.toml"))
     parser.add_argument("--state-dir", type=Path, default=Path(".mypypi"))
+    parser.add_argument("--config", type=Path, default=Path("pyproject.toml"))
     commands = parser.add_subparsers(dest="command")
 
     add = commands.add_parser("add", help="resolve package requirements into the catalog")
@@ -70,12 +112,11 @@ def create_parser() -> argparse.ArgumentParser:
     _add_platform_arguments(build)
 
     validate = commands.add_parser("validate", help="validate pending wheels")
-    validate.add_argument("--index-url", required=True)
+    validate.add_argument("--output", type=Path, default=Path("dist"))
     _add_platform_arguments(validate)
 
     publish_command = commands.add_parser("publish", help="publish validated wheels to a local index")
     publish_command.add_argument("--output", type=Path, required=True)
-    publish_command.add_argument("--index-url", required=True)
     _add_platform_arguments(publish_command)
     return parser
 
@@ -359,12 +400,36 @@ def _published_inventory(
                 target = known_targets.get(platform_name)
                 if target is None:
                     raise ValueError(f"manifest target is not configured: {platform_name}")
+                preferred_tags = ordered_target_tags(
+                    target, settings.linux_repair_policy
+                )
+                preference = {
+                    tag: index for index, tag in enumerate(preferred_tags)
+                }
+                rank = min(
+                    (preference[tag] for tag in identity.tags if tag in preference),
+                    default=None,
+                )
+                if rank is None:
+                    raise ValueError(
+                        f"published wheel tags do not cover recorded target {target.platform}"
+                    )
                 key = (identity.package, target)
                 record = ArtifactRecord(identity, checksum)
                 existing = inventory.get(key)
-                if existing is not None and existing != record:
-                    raise ValueError(f"multiple published wheels cover {identity.package} on {target.platform}")
-                inventory[key] = record
+                if existing is None:
+                    inventory[key] = record
+                else:
+                    existing_rank = min(
+                        (preference[tag] for tag in existing.wheel.tags if tag in preference),
+                        default=None,
+                    )
+                    if existing_rank is None:
+                        raise ValueError(
+                            f"published wheel tags do not cover recorded target {target.platform}"
+                        )
+                    if (rank, identity.filename) < (existing_rank, existing.wheel.filename):
+                        inventory[key] = record
         except (KeyError, TypeError, ValueError, OSError) as cause:
             raise _error(
                 ErrorKind.INTEGRITY,
@@ -377,21 +442,7 @@ def _published_inventory(
 def _published_artifacts(
     output: Path, settings: ProjectSettings
 ) -> tuple[ValidatedArtifact, ...]:
-    inventory = _published_inventory(output, settings)
-    grouped: dict[str, tuple[ArtifactRecord, set[Target]]] = {}
-    for (_, target), record in inventory.items():
-        if record.wheel.filename not in grouped:
-            grouped[record.wheel.filename] = (record, set())
-        grouped[record.wheel.filename][1].add(target)
-    return tuple(
-        ValidatedArtifact(
-            record.wheel,
-            output / "wheels" / filename,
-            record.sha256,
-            frozenset(targets),
-        )
-        for filename, (record, targets) in sorted(grouped.items())
-    )
+    return read_published_artifacts(output)
 
 
 def _pending_inventory(
@@ -466,6 +517,8 @@ def _create_plan(
     output: Path,
     state_dir: Path,
 ) -> tuple[tuple[PlanOutcome, ...], dict[PackageVersion, Release], dict[str, Path]]:
+    configured_targets = settings.targets()
+    validate_catalog_targets(catalog, configured_targets)
     published = _published_inventory(output, settings)
     pending, local_paths = _pending_inventory(
         _wheel_paths(state_dir), catalog, targets, settings, published
@@ -474,6 +527,8 @@ def _create_plan(
     releases: dict[PackageVersion, Release] = {}
     for entry in catalog.entries:
         for target in targets:
+            if entry.platforms is not None and target.platform not in entry.platforms:
+                continue
             key = (entry.package, target)
             if target.platform in dict(entry.excluded_platforms):
                 continue
@@ -486,10 +541,11 @@ def _create_plan(
                     allow_yanked_reason=entry.yanked_reason,
                 )
                 releases[entry.package] = release
-            if not release.requires_python.contains(str(target.python_version), prereleases=True):
+            execution_version = target_python_version(target)
+            if not release.requires_python.contains(str(execution_version), prereleases=True):
                 raise _error(
                     ErrorKind.INCOMPATIBLE,
-                    f"Requires-Python {release.requires_python} excludes Python {target.python_version}",
+                    f"Requires-Python {release.requires_python} excludes Python {execution_version}",
                     FailureStage.PLANNING,
                     entry.package,
                     target,
@@ -499,22 +555,31 @@ def _create_plan(
                 target,
                 linux_repair_policy=settings.linux_repair_policy,
             )
-            if wheel_files:
-                upstream[key] = tuple(
-                    UpstreamWheel(
-                        WheelIdentity.parse(item.filename),
-                        item.url,
-                        item.sha256,
-                    )
-                    for item in wheel_files
+            candidates: list[UpstreamWheel | UpstreamSdist] = [
+                UpstreamWheel(
+                    WheelIdentity.parse(item.filename),
+                    item.url,
+                    item.sha256,
                 )
-            elif release.sdist is not None:
-                upstream[key] = (
-                    UpstreamSdist(release.sdist.url, release.sdist.sha256),
+                for item in wheel_files
+            ]
+            candidates.extend(
+                UpstreamSdist(item.url, item.sha256)
+                for item in release.sdists
+                if item.requires_python is None
+                or item.requires_python.contains(
+                    str(execution_version), prereleases=True
                 )
-            else:
-                upstream[key] = ()
-    outcomes = plan(catalog, targets, published, upstream, pending)
+            )
+            upstream[key] = tuple(candidates)
+    outcomes = plan(
+        catalog,
+        targets,
+        published,
+        upstream,
+        pending,
+        configured_targets,
+    )
     return outcomes, releases, local_paths
 
 
@@ -535,30 +600,13 @@ def _outcome_text(outcome: PlanOutcome) -> str:
 
 
 def _build_index(url: str, strict: bool) -> str:
-    parsed = urlsplit(url)
-    if parsed.scheme != "https" or not parsed.netloc or parsed.username or parsed.password:
-        raise _error(
-            ErrorKind.CONFIGURATION,
-            "build dependency index must be an HTTPS URL without credentials",
-            FailureStage.CONFIGURATION,
-        )
-    public_hosts = {"pypi.org", "pythonhosted.org"}
-    host = (parsed.hostname or "").rstrip(".").lower()
-    if strict and (
-        host in public_hosts
-        or any(host.endswith(f".{suffix}") for suffix in public_hosts)
-    ):
-        raise _error(
-            ErrorKind.CONFIGURATION,
-            "--strict-build-deps requires a curated build dependency index",
-            FailureStage.CONFIGURATION,
-        )
-    return url
+    return validate_build_index(url, strict=strict)
 
 
 def _command_add(
     arguments: argparse.Namespace, settings: ProjectSettings
 ) -> int:
+    print(_runtime_description(settings))
     resolved = add_packages(
         arguments.catalog,
         arguments.requirements,
@@ -591,8 +639,27 @@ def _command_build(
     catalog: Catalog,
     settings: ProjectSettings,
 ) -> int:
+    print(_runtime_description(settings))
     targets = _selected_targets(settings, arguments.platform)
     build_index = _build_index(arguments.build_index, arguments.strict_build_deps)
+    build_constraints = None
+    if arguments.build_constraints is not None:
+        try:
+            build_constraints = arguments.build_constraints.resolve(strict=True)
+            constraints_mode = build_constraints.lstat().st_mode
+        except OSError as cause:
+            raise _error(
+                ErrorKind.CONFIGURATION,
+                f"could not read build constraints at {arguments.build_constraints}",
+                FailureStage.CONFIGURATION,
+            ) from cause
+        if stat.S_ISLNK(constraints_mode) or not stat.S_ISREG(constraints_mode):
+            raise _error(
+                ErrorKind.CONFIGURATION,
+                f"build constraints must be a regular file: {arguments.build_constraints}",
+                FailureStage.CONFIGURATION,
+            )
+    prebuild_cwd = Path.cwd().resolve()
     wheel_dir = arguments.state_dir / "wheels"
     _real_directory(arguments.state_dir, create=True)
     _real_directory(wheel_dir, create=True)
@@ -608,99 +675,59 @@ def _command_build(
             conflicts[0].package,
             conflicts[0].target,
         )
-    completed: set[str] = set()
-    count = 0
+    for outcome in outcomes:
+        if isinstance(outcome, BuildSdist):
+            require_native_target(outcome.target)
+    completed: dict[PackageVersion, list[Path]] = {}
+    prepared: dict[str, tuple[Path, str]] = {}
     entries = catalog.by_package()
     for outcome in outcomes:
-        if isinstance(outcome, DownloadWheel):
-            if outcome.wheel.filename in completed:
-                continue
-            entry = entries[outcome.package]
-            release = releases[outcome.package]
-            path = None
-            for candidate in compatible_wheels(
-                release,
-                outcome.target,
-                linux_repair_policy=settings.linux_repair_policy,
-            ):
-                if candidate.filename != outcome.wheel.filename:
-                    continue
-                path = candidate
-                break
-            if path is None:
-                raise _error(
-                    ErrorKind.INTEGRITY,
-                    "planned wheel is missing from release metadata",
-                    FailureStage.ACQUISITION,
-                    outcome.package,
-                    outcome.target,
-                )
-            file_by_name = {item.filename: item for item in release.wheels}
-            selected = file_by_name[path.filename]
-            downloaded = select_or_download(
-                release,
-                outcome.target,
-                wheel_dir,
-                linux_repair_policy=settings.linux_repair_policy,
-                allow_yanked_reason=entry.yanked_reason,
-            )
-            if downloaded is None:
-                raise _error(
-                    ErrorKind.MISSING_ARTIFACT,
-                    f"no acceptable upstream wheel for {outcome.package.name}=={outcome.package.version}",
-                    FailureStage.ACQUISITION,
-                    outcome.package,
-                    outcome.target,
-                )
-            if downloaded.name != selected.filename:
-                raise _error(
-                    ErrorKind.INTEGRITY,
-                    "acquired wheel differs from the planned wheel",
-                    FailureStage.ACQUISITION,
-                    outcome.package,
-                    outcome.target,
-                )
-            completed.add(downloaded.name)
-            count += 1
-        elif isinstance(outcome, BuildSdist):
-            release = releases[outcome.package]
-            if release.sdist is None:
-                raise _error(
-                    ErrorKind.MISSING_ARTIFACT,
-                    "planned source archive is missing from release metadata",
-                    FailureStage.ACQUISITION,
-                    outcome.package,
-                    outcome.target,
-                )
-            entry = entries[outcome.package]
+        if not isinstance(outcome, (DownloadWheel, BuildSdist)):
+            continue
+        entry = entries[outcome.package]
+        release = releases[outcome.package]
+        path = None
+        for existing in completed.get(outcome.package, ()):
             try:
-                require_native_target(outcome.target)
-            except MypypiError as cause:
-                raise _error(
-                    cause.kind,
-                    cause.detail,
-                    cause.context.stage,
+                validate_wheel_metadata(
+                    existing,
                     outcome.package,
                     outcome.target,
-                ) from cause
-            built = build_from_sdist(
-                outcome.package,
+                    linux_repair_policy=settings.linux_repair_policy,
+                )
+                validate_wheel_architectures(existing, outcome.target)
+            except CompatibilityRejection:
+                continue
+            path = existing
+            break
+        if path is None:
+            path = acquire_or_build(
+                release,
                 outcome.target,
-                release.sdist,
                 wheel_dir,
                 index_url=build_index,
+                linux_repair_policy=settings.linux_repair_policy,
+                allow_yanked_reason=entry.yanked_reason,
                 likely_binary_ignore=tuple(
-                    path for path, _ in entry.build.likely_binary_ignore
+                    ignored_path for ignored_path, _ in entry.build.likely_binary_ignore
                 ),
                 custom_prebuild=entry.build.custom_prebuild,
-                linux_repair_policy=settings.linux_repair_policy,
-                build_constraints=arguments.build_constraints,
+                build_constraints=build_constraints,
+                prebuild_cwd=prebuild_cwd,
                 require_build_hashes=arguments.require_build_hashes,
             )
-            completed.add(built.name)
-            count += 1
+            completed.setdefault(outcome.package, []).append(path)
+        if path.name not in prepared:
+            origin = (
+                "upstream wheel"
+                if any(item.filename == path.name for item in release.wheels)
+                else "source build"
+            )
+            prepared[path.name] = (path, origin)
     pending_count = sum(isinstance(item, PendingValidation) for item in outcomes)
-    print(f"prepared {count} wheel(s); {pending_count} pending validation")
+    for path, origin in prepared.values():
+        print(f"prepared {path.name} from {origin}")
+    print(f"prepared {len(prepared)} wheel(s); {pending_count} pending validation")
     return 0
 
 
@@ -729,72 +756,226 @@ def _validation_policy(entry: PackageEntry) -> ValidationPolicy:
     return ValidationPolicy(tuple(exceptions))
 
 
+@contextmanager
 def _validated_artifacts(
     arguments: argparse.Namespace,
     catalog: Catalog,
     settings: ProjectSettings,
-) -> tuple[ValidatedArtifact, ...]:
+) -> Iterator[tuple[tuple[ValidatedArtifact, ...], int]]:
     targets = _selected_targets(settings, arguments.platform)
-    paths = _wheel_paths(arguments.state_dir)
+    validate_catalog_targets(catalog, settings.targets())
     entries = catalog.by_package()
-    eligible = []
-    for path in paths:
+    published = read_published_artifacts(arguments.output)
+    published_by_filename = {
+        artifact.identity.filename: artifact for artifact in published
+    }
+    staged: dict[str, tuple[WheelIdentity, Path, str, frozenset[Target]]] = {}
+    for path in _wheel_paths(arguments.state_dir):
         identity = WheelIdentity.parse(path.name)
-        if identity.package not in entries:
+        entry = entries.get(identity.package)
+        if entry is None:
             raise _error(
                 ErrorKind.INVALID_INPUT,
-                f"wheel is not listed in the catalog: {identity.package.name}=={identity.package.version}",
+                f"wheel is not listed at this version in the catalog: "
+                f"{identity.package.name}=={identity.package.version}",
                 FailureStage.VALIDATION,
                 identity.package,
             )
-        if any(
-            identity.tags.intersection(
+        applicable_targets = frozenset(
+            target
+            for target in targets
+            if (entry.platforms is None or target.platform in entry.platforms)
+            and target.platform not in dict(entry.excluded_platforms)
+            and identity.tags.intersection(
                 ordered_target_tags(target, settings.linux_repair_policy)
             )
-            for target in targets
-        ):
-            eligible.append(path)
-    if not eligible:
-        raise _error(
-            ErrorKind.MISSING_ARTIFACT,
-            "no pending wheels match the selected platforms",
-            FailureStage.VALIDATION,
         )
+        if not applicable_targets:
+            continue
+        checksum = _sha256(path)
+        existing = published_by_filename.get(identity.filename)
+        if existing is not None and existing.sha256 != checksum:
+            raise _error(
+                ErrorKind.CONFLICT,
+                f"wheel filename differs from published bytes: {identity.filename}",
+                FailureStage.VALIDATION,
+                identity.package,
+            )
+        staged[identity.filename] = (identity, path, checksum, applicable_targets)
+
+    obligations = tuple(
+        (entry, target)
+        for entry in catalog.entries
+        for target in targets
+        if (entry.platforms is None or target.platform in entry.platforms)
+        and target.platform not in dict(entry.excluded_platforms)
+    )
+    for entry, target in obligations:
+        existing_coverage = any(
+            artifact.identity.package == entry.package and target in artifact.targets
+            for artifact in published
+        )
+        staged_candidate = any(
+            identity.package == entry.package and target in applicable_targets
+            for identity, _, _, applicable_targets in staged.values()
+        )
+        if not existing_coverage and not staged_candidate:
+            raise _error(
+                ErrorKind.MISSING_ARTIFACT,
+                f"catalog package has no candidate wheel for {target.platform}",
+                FailureStage.VALIDATION,
+                entry.package,
+                target,
+            )
+
+    targets_to_validate = {
+        filename: frozenset(
+            target
+            for target in applicable_targets
+            if filename not in published_by_filename
+            or target not in published_by_filename[filename].targets
+        )
+        for filename, (_, _, _, applicable_targets) in staged.items()
+    }
+    targets_to_validate = {
+        filename: candidates
+        for filename, candidates in targets_to_validate.items()
+        if candidates
+    }
+    local_platform = _local_platform()
+    for target in sorted(
+        {target for candidates in targets_to_validate.values() for target in candidates},
+        key=lambda value: value.platform,
+    ):
+        if local_platform != target.platform:
+            raise _error(
+                ErrorKind.INCOMPATIBLE,
+                f"validation requires a native {target.platform} runner; "
+                f"current runner is {local_platform or 'unsupported'}",
+                FailureStage.VALIDATION,
+                target=target,
+            )
+
     policies = {
         package: _validation_policy(entry) for package, entry in entries.items()
     }
-    metadata = validate_wheels(
-        tuple(eligible),
-        targets=targets,
-        wheel_set=arguments.state_dir / "wheels",
-        index_url=arguments.index_url,
-        policies=policies,
-        linux_repair_policy=settings.linux_repair_policy,
-    )
-    by_filename = {path.name: path for path in eligible}
-    validated: dict[str, ValidatedArtifact] = {}
-    for item in metadata:
-        path = by_filename[item.identity.filename]
-        supported = frozenset(
-            target
-            for target in targets
-            if item.identity.tags.intersection(
-                ordered_target_tags(target, settings.linux_repair_policy)
+    validated_targets: dict[str, set[Target]] = {}
+    copied_paths: dict[str, Path] = {}
+    no_import_results = 0
+    with tempfile.TemporaryDirectory(prefix="mypypi-candidate-") as directory:
+        snapshot_root = Path(directory)
+        for target in targets:
+            candidate_sources: dict[str, tuple[Path, str]] = {}
+            for artifact in published:
+                if target in artifact.targets:
+                    candidate_sources[artifact.identity.filename] = (
+                        artifact.path,
+                        artifact.sha256,
+                    )
+            for filename, (identity, path, checksum, applicable_targets) in staged.items():
+                if target not in applicable_targets:
+                    continue
+                existing = published_by_filename.get(filename)
+                if existing is not None and target in existing.targets:
+                    continue
+                candidate_sources[filename] = (path, checksum)
+
+            if not candidate_sources:
+                continue
+            wheel_set = snapshot_root / target.platform
+            wheel_set.mkdir()
+            target_paths: dict[str, Path] = {}
+            for filename, (source, expected_hash) in sorted(candidate_sources.items()):
+                wheel_path = wheel_set / filename
+                shutil.copyfile(source, wheel_path)
+                if _sha256(wheel_path) != expected_hash:
+                    raise _error(
+                        ErrorKind.INTEGRITY,
+                        f"wheel changed while making candidate snapshot: {filename}",
+                        FailureStage.VALIDATION,
+                    )
+                target_paths[filename] = wheel_path
+                copied_paths.setdefault(filename, wheel_path)
+
+            pending = []
+            for filename, required_targets in targets_to_validate.items():
+                if target not in required_targets:
+                    continue
+                wheel_path = target_paths.get(filename)
+                if wheel_path is None:
+                    raise _error(
+                        ErrorKind.INTEGRITY,
+                        f"candidate wheel is absent from target snapshot: {filename}",
+                        FailureStage.VALIDATION,
+                    )
+                inspect_wheel(
+                    wheel_path,
+                    target,
+                    settings.linux_repair_policy,
+                )
+                pending.append(wheel_path)
+            metadata = validate_wheels(
+                tuple(pending),
+                targets=(target,),
+                wheel_set=wheel_set,
+                policies=policies,
+                linux_repair_policy=settings.linux_repair_policy,
             )
+            for item in metadata:
+                filename = item.identity.filename
+                validated_targets.setdefault(filename, set()).add(target)
+                if not item.imports:
+                    no_import_results += 1
+            for filename, wheel_path in target_paths.items():
+                if _sha256(wheel_path) != candidate_sources[filename][1]:
+                    raise _error(
+                        ErrorKind.INTEGRITY,
+                        f"candidate wheel changed during validation: {filename}",
+                        FailureStage.VALIDATION,
+                    )
+
+        new_artifacts = []
+        for filename, (identity, _, checksum, _) in sorted(staged.items()):
+            covered = validated_targets.get(filename)
+            if not covered:
+                continue
+            new_artifacts.append(
+                ValidatedArtifact(
+                    identity,
+                    copied_paths[filename],
+                    checksum,
+                    frozenset(covered),
+                )
+            )
+
+        coverage = {
+            (artifact.identity.package, target)
+            for artifact in published
+            for target in artifact.targets
+        }
+        coverage.update(
+            (WheelIdentity.parse(filename).package, target)
+            for filename, covered in validated_targets.items()
+            for target in covered
         )
-        validated[item.identity.filename] = ValidatedArtifact(
-            item.identity,
-            path,
-            _sha256(path),
-            supported,
+        missing = next(
+            (
+                (entry, target)
+                for entry, target in obligations
+                if (entry.package, target) not in coverage
+            ),
+            None,
         )
-    if not validated:
-        raise _error(
-            ErrorKind.MISSING_ARTIFACT,
-            "no wheels passed validation for the selected platforms",
-            FailureStage.VALIDATION,
-        )
-    return tuple(validated[name] for name in sorted(validated))
+        if missing is not None:
+            entry, target = missing
+            raise _error(
+                ErrorKind.MISSING_ARTIFACT,
+                f"catalog package has no validated wheel for {target.platform}",
+                FailureStage.VALIDATION,
+                entry.package,
+                target,
+            )
+        yield tuple(new_artifacts), no_import_results
 
 
 def _command_validate(
@@ -802,8 +983,12 @@ def _command_validate(
     catalog: Catalog,
     settings: ProjectSettings,
 ) -> int:
-    artifacts = _validated_artifacts(arguments, catalog, settings)
-    print(f"validated {len(artifacts)} wheel(s)")
+    print(_runtime_description(settings))
+    with _validated_artifacts(arguments, catalog, settings) as (artifacts, no_imports):
+        print(
+            f"validated {len(artifacts)} new wheel(s) from the local candidate snapshot; "
+            f"{no_imports} wheel-target pair(s) had no importable modules"
+        )
     return 0
 
 
@@ -812,37 +997,29 @@ def _command_publish(
     catalog: Catalog,
     settings: ProjectSettings,
 ) -> int:
-    new_artifacts = _validated_artifacts(arguments, catalog, settings)
-    by_filename = {
-        artifact.identity.filename: artifact
-        for artifact in _published_artifacts(arguments.output, settings)
-    }
-    for artifact in new_artifacts:
-        existing = by_filename.get(artifact.identity.filename)
-        if existing is not None:
-            if existing.sha256 != artifact.sha256:
-                raise _error(
-                    ErrorKind.CONFLICT,
-                    f"wheel filename differs from published bytes: {artifact.identity.filename}",
-                    FailureStage.PUBLICATION,
-                    artifact.identity.package,
-                )
-            artifact = ValidatedArtifact(
-                artifact.identity,
-                artifact.path,
-                artifact.sha256,
-                artifact.targets | existing.targets,
-            )
-        by_filename[artifact.identity.filename] = artifact
-    artifacts = tuple(by_filename[name] for name in sorted(by_filename))
-    entries = catalog.by_package()
-    yanked = {
-        artifact.identity.filename: entries[artifact.identity.package].yanked_reason
-        for artifact in artifacts
-        if entries[artifact.identity.package].yanked_reason is not None
-    }
-    current = publish(artifacts, arguments.output, yanked=yanked)
-    print(f"published {len(artifacts)} wheel(s) at {current}")
+    print(_runtime_description(settings))
+    with _validated_artifacts(arguments, catalog, settings) as (new_artifacts, no_imports):
+        entries = catalog.by_package()
+        yanked: dict[str, str | None] = {}
+        for artifact in read_published_artifacts(arguments.output):
+            entry = entries.get(artifact.identity.package)
+            if entry is None:
+                continue
+            if entry.clear_yanked:
+                yanked[artifact.identity.filename] = None
+            elif entry.yanked_reason is not None:
+                yanked[artifact.identity.filename] = entry.yanked_reason
+        for artifact in new_artifacts:
+            entry = entries[artifact.identity.package]
+            if entry.clear_yanked:
+                yanked[artifact.identity.filename] = None
+            elif entry.yanked_reason is not None:
+                yanked[artifact.identity.filename] = entry.yanked_reason
+        current = publish(new_artifacts, arguments.output, yanked=yanked)
+    print(
+        f"published {len(new_artifacts)} new wheel(s) at {current}; "
+        f"{no_imports} wheel-target pair(s) had no importable modules"
+    )
     return 0
 
 
@@ -867,7 +1044,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     settings: ProjectSettings | None = None
     try:
-        settings = load_project_settings()
+        settings = load_project_settings(arguments.config)
+        _runtime_description(settings)
         catalog = _load_catalog(arguments.catalog)
         if arguments.command == "add":
             return _command_add(arguments, settings)

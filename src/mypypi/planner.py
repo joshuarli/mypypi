@@ -44,12 +44,38 @@ type UpstreamArtifact = UpstreamWheel | UpstreamSdist
 type ArtifactKey = tuple[PackageVersion, Target]
 
 
+def validate_catalog_targets(
+    catalog: Catalog, configured_targets: tuple[Target, ...]
+) -> None:
+    configured_platforms = {target.platform for target in configured_targets}
+    for entry in catalog.entries:
+        unknown_platforms = set(dict(entry.excluded_platforms)) - configured_platforms
+        unknown_applicability = set(entry.platforms or ()) - configured_platforms
+        if unknown_platforms:
+            raise MypypiError(
+                ErrorKind.CONFIGURATION,
+                "unsupported excluded platform for "
+                f"{entry.package.name}=={entry.package.version}: "
+                f"{sorted(unknown_platforms)[0]}",
+                FailureContext(FailureStage.CONFIGURATION, entry.package),
+            )
+        if unknown_applicability:
+            raise MypypiError(
+                ErrorKind.CONFIGURATION,
+                "unsupported target platform for "
+                f"{entry.package.name}=={entry.package.version}: "
+                f"{sorted(unknown_applicability)[0]}",
+                FailureContext(FailureStage.CONFIGURATION, entry.package),
+            )
+
+
 def plan(
     catalog: Catalog,
     targets: tuple[Target, ...],
     published: dict[ArtifactKey, ArtifactRecord],
     upstream: dict[ArtifactKey, tuple[UpstreamArtifact, ...]],
     pending_validation: dict[ArtifactKey, ArtifactRecord] | None = None,
+    configured_targets: tuple[Target, ...] | None = None,
 ) -> tuple[PlanOutcome, ...]:
     pending_validation = pending_validation or {}
     outcomes: list[PlanOutcome] = []
@@ -57,18 +83,14 @@ def plan(
     local_filenames: dict[str, ArtifactRecord] = {
         artifact.wheel.filename: artifact for artifact in local_artifacts
     }
-    configured_platforms = {target.platform for target in targets}
+    if configured_targets is None:
+        configured_targets = targets
+    validate_catalog_targets(catalog, configured_targets)
     for entry in catalog.entries:
         exclusions = dict(entry.excluded_platforms)
-        unknown_platforms = set(exclusions) - configured_platforms
-        if unknown_platforms:
-            raise MypypiError(
-                ErrorKind.CONFIGURATION,
-                "unsupported excluded platform for "
-                f"{entry.package.name}=={entry.package.version}: {sorted(unknown_platforms)[0]}",
-                FailureContext(FailureStage.CONFIGURATION, entry.package),
-            )
         for target in targets:
+            if entry.platforms is not None and target.platform not in entry.platforms:
+                continue
             key = (entry.package, target)
             reason = exclusions.get(target.platform)
             if reason is not None:

@@ -1,5 +1,7 @@
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Barrier
 
 import pytest
 from packaging.version import Version
@@ -7,6 +9,7 @@ from packaging.version import Version
 import mypypi.add as add_module
 from mypypi.add import (
     _PYTHON_PLATFORMS,
+    _parse_compiled,
     add_packages,
     append_entries,
     parse_pins,
@@ -34,6 +37,29 @@ def test_add_requires_exact_pinned_input():
     with pytest.raises(MypypiError, match="conflicting requested pins") as raised:
         parse_pins(("demo-pkg==1.0", "Demo_Pkg==2.0"))
     assert raised.value.kind is ErrorKind.CONFLICT
+    assert parse_pins(("Demo_Pkg[extra]==1.2.0",))[0].name == "demo-pkg"
+
+
+def test_parse_compiled_accepts_actual_uv_output_and_pep508_markers_and_extras():
+    actual_uv_output = """certifi==2026.10.19
+charset-normalizer==3.5.2
+idna==3.20
+requests==2.32.4
+urllib3==2.8.0
+"""
+    assert [
+        f"{package.name}=={package.version}"
+        for package in _parse_compiled(actual_uv_output)
+    ] == [
+        "certifi==2026.10.19",
+        "charset-normalizer==3.5.2",
+        "idna==3.20",
+        "requests==2.32.4",
+        "urllib3==2.8.0",
+    ]
+    assert _parse_compiled(
+        'requests[security]==2.32.4 ; python_version >= "3.12"\n'
+    ) == parse_pins(("requests[security]==2.32.4",))
 
 
 def test_uv_platform_mapping_covers_project_targets():
@@ -48,8 +74,8 @@ def test_dependency_resolution_uses_python_315_and_each_configured_platform():
     def run(command, **kwargs):
         calls.append((command, kwargs))
         resolved = {
-            "x86_64-unknown-linux-gnu": "base-lib==1.0\nlinux-only==2.0\n",
-            "aarch64-unknown-linux-gnu": "base-lib==1.0\nlinux-only==2.0\n",
+            "x86_64-manylinux_2_28": "base-lib==1.0\nlinux-only==2.0\n",
+            "aarch64-manylinux_2_28": "base-lib==1.0\nlinux-only==2.0\n",
             "x86_64-apple-darwin": "base-lib==1.0\nmac-only==3.0\n",
             "aarch64-apple-darwin": "base-lib==1.0\nmac-only==3.0\n",
         }
@@ -63,8 +89,8 @@ def test_dependency_resolution_uses_python_315_and_each_configured_platform():
         ("root", "1.0"),
     ]
     assert len(calls) == 4
-    assert {call[0][call[0].index("--python-version=3.15")] for call in calls} == {
-        "--python-version=3.15"
+    assert {call[0][call[0].index("--python-version=3.15.0")] for call in calls} == {
+        "--python-version=3.15.0"
     }
     assert {
         next(arg.split("=", 1)[1] for arg in call[0] if arg.startswith("--python-platform="))
@@ -73,15 +99,116 @@ def test_dependency_resolution_uses_python_315_and_each_configured_platform():
     assert all(call[1]["input"] == "root==1.0" for call in calls)
 
 
-def test_dependency_resolution_rejects_cross_platform_version_conflicts():
+def test_dependency_resolution_keeps_different_versions_on_separate_platforms():
     def run(command, **kwargs):
         platform = next(arg.split("=", 1)[1] for arg in command if arg.startswith("--python-platform="))
-        version = "1.0" if platform.endswith("linux-gnu") else "2.0"
+        version = "1.0" if "manylinux" in platform else "2.0"
         return subprocess.CompletedProcess(command, 0, f"shared=={version}\n", "")
 
-    with pytest.raises(MypypiError, match="conflicts across configured platforms") as raised:
-        resolve_dependencies(("root==1.0",), TARGETS, "/python/3.15", run)
+    resolved = resolve_dependencies(("root==1.0",), TARGETS, "/python/3.15", run)
+    assert [(package.name, str(package.version)) for package in resolved] == [
+        ("root", "1.0"),
+        ("shared", "1.0"),
+        ("shared", "2.0"),
+    ]
+
+
+def test_dependency_resolution_reports_a_conflict_for_one_target():
+    def run(command, **kwargs):
+        return subprocess.CompletedProcess(
+            command, 0, "shared==1.0\nshared==2.0\n", ""
+        )
+
+    with pytest.raises(MypypiError, match="conflicts for shared on linux-x86_64") as raised:
+        resolve_dependencies(("root==1.0",), TARGETS[:1], "/python/3.15", run)
     assert raised.value.kind is ErrorKind.CONFLICT
+    assert raised.value.context.target == TARGETS[0]
+    assert raised.value.context.package.name == "shared"
+
+
+def test_add_keeps_root_global_and_transitive_marker_pins_targeted(tmp_path: Path):
+    path = tmp_path / "packages.toml"
+    path.write_text("# keep this note\npackages = []\n", encoding="utf-8")
+    target_results = {
+        "x86_64-manylinux_2_28": (
+            'root[feature]==1.0 ; python_version >= "3.15"\n'
+            'linux-only==2.0 ; sys_platform == "linux"\n'
+        ),
+        "x86_64-apple-darwin": (
+            'root[feature]==1.0 ; python_version >= "3.15"\n'
+            'mac-only==3.0 ; sys_platform == "darwin"\n'
+        ),
+    }
+
+    def run(command, **kwargs):
+        platform = next(
+            arg.split("=", 1)[1]
+            for arg in command
+            if arg.startswith("--python-platform=")
+        )
+        return subprocess.CompletedProcess(command, 0, target_results[platform], "")
+
+    add_packages(
+        path,
+        ("root[feature]==1.0",),
+        (TARGETS[0], TARGETS[2]),
+        "/python/3.15",
+        run,
+    )
+    entries = parse_catalog(path.read_text(encoding="utf-8")).by_package()
+    assert entries[parse_pins(("root==1.0",))[0]].platforms is None
+    assert entries[parse_pins(("linux-only==2.0",))[0]].platforms == (
+        "linux-x86_64",
+    )
+    assert entries[parse_pins(("mac-only==3.0",))[0]].platforms == (
+        "macos-x86_64",
+    )
+    assert "# keep this note" in path.read_text(encoding="utf-8")
+
+
+def test_add_records_two_satisfiable_versions_for_their_targets(tmp_path: Path):
+    path = tmp_path / "packages.toml"
+    path.write_text("packages = []\n", encoding="utf-8")
+
+    def run(command, **kwargs):
+        platform = next(
+            arg.split("=", 1)[1]
+            for arg in command
+            if arg.startswith("--python-platform=")
+        )
+        version = "1.0" if "manylinux" in platform else "2.0"
+        return subprocess.CompletedProcess(
+            command, 0, f"root==3.0\nshared=={version}\n", ""
+        )
+
+    add_packages(path, ("root==3.0",), TARGETS[:1] + TARGETS[2:3], "/python/3.15", run)
+    entries = parse_catalog(path.read_text(encoding="utf-8")).by_package()
+    assert entries[parse_pins(("shared==1.0",))[0]].platforms == ("linux-x86_64",)
+    assert entries[parse_pins(("shared==2.0",))[0]].platforms == ("macos-x86_64",)
+
+
+def test_repeated_additions_union_platforms_without_rewriting_comments(tmp_path: Path):
+    path = tmp_path / "packages.toml"
+    path.write_text("# preserve this note\npackages = []\n", encoding="utf-8")
+
+    def run(command, **kwargs):
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            "root==1.0\nshared==2.0\n",
+            "",
+        )
+
+    for target in (TARGETS[0], TARGETS[2], TARGETS[2]):
+        add_packages(path, ("root==1.0",), (target,), "/python/3.15", run)
+    source = path.read_text(encoding="utf-8")
+    entries = parse_catalog(source).by_package()
+    assert entries[parse_pins(("shared==2.0",))[0]].platforms == (
+        "linux-x86_64",
+        "macos-x86_64",
+    )
+    assert source.count("name = \"shared\"") == 2
+    assert "# preserve this note" in source
 
 
 def test_dependency_resolution_rejects_uv_failures():
@@ -126,6 +253,41 @@ def test_catalog_path_add_preserves_comments_and_does_not_rewrite_if_unchanged(t
     assert [(package.name, str(package.version)) for package in added] == [("leaf", "2.0"), ("root", "1.0")]
     assert add_packages(path, ("root==1.0",), TARGETS[:1], "/python/3.15", run) == added
     assert path.read_text(encoding="utf-8") == updated
+
+
+def test_concurrent_additions_keep_each_pin_and_existing_comments(tmp_path: Path):
+    path = tmp_path / "packages.toml"
+    path.write_text("# retain this comment\npackages = []\n", encoding="utf-8")
+    compile_barrier = Barrier(2)
+
+    def run(command, **kwargs):
+        compile_barrier.wait(timeout=5)
+        return subprocess.CompletedProcess(command, 0, kwargs["input"] + "\n", "")
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        additions = (
+            executor.submit(
+                add_packages,
+                path,
+                ("alpha==1.0",),
+                TARGETS[:1],
+                "/python/3.15",
+                run,
+            ),
+            executor.submit(
+                add_packages,
+                path,
+                ("beta==2.0",),
+                TARGETS[:1],
+                "/python/3.15",
+                run,
+            ),
+        )
+        assert all(addition.result(timeout=10) for addition in additions)
+
+    catalog = parse_catalog(path.read_text(encoding="utf-8"))
+    assert {entry.package.name for entry in catalog.entries} == {"alpha", "beta"}
+    assert "# retain this comment" in path.read_text(encoding="utf-8")
 
 
 def test_catalog_update_failure_preserves_the_existing_file(tmp_path: Path, monkeypatch):

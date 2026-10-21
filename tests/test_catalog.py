@@ -39,7 +39,41 @@ version = "1.0"
     assert latest.excluded_platforms == (
         ("linux-aarch64", "upstream has no compatible source"),
     )
+    assert latest.platforms is None
     assert str(historical.package.version) == "1.0"
+
+
+def test_catalog_preserves_custom_prebuild_command_order():
+    catalog = parse_catalog('''
+[[packages]]
+name = "sample-pkg"
+version = "2.0"
+[packages.build]
+custom_prebuild = {
+  "python first.py --prefix {prefix}" = "prepare source",
+  "python second.py --prefix {prefix}" = "compile extension"
+}
+''')
+    assert catalog.entries[0].build.custom_prebuild == (
+        ("python first.py --prefix {prefix}", "prepare source"),
+        ("python second.py --prefix {prefix}", "compile extension"),
+    )
+
+
+def test_catalog_unions_disjoint_pin_platforms():
+    catalog = parse_catalog('''
+[[packages]]
+name = "shared"
+version = "1.0"
+platforms = ["linux-x86_64"]
+
+[[packages]]
+name = "shared"
+version = "1.0"
+platforms = ["macos-arm64"]
+''')
+    assert len(catalog.entries) == 1
+    assert catalog.entries[0].platforms == ("linux-x86_64", "macos-arm64")
 
 
 @pytest.mark.parametrize(
@@ -54,6 +88,10 @@ version = "1.0"
             'packages = [{ name = "sample-pkg", version = "1.0", '
             'exclude_platforms = { "linux-x86_64" = " " } }]',
             "non-empty reason",
+        ),
+        (
+            'packages = [{ name = "sample-pkg", version = "1.0", platforms = [] }]',
+            "non-empty array",
         ),
         (
             'packages = [{ name = "sample-pkg", version = "1.0", '
@@ -74,3 +112,22 @@ def test_catalog_rejects_malformed_entries_and_unknown_keys(source, detail):
 
 def test_catalog_parses_empty_catalog():
     assert parse_catalog("packages = []").entries == ()
+
+
+def test_catalog_requires_an_explanation_to_yank_and_explicit_false_to_clear():
+    yanked = parse_catalog(
+        'packages = [{ name = "sample-pkg", version = "1.0", '
+        'yanked = true, yanked_reason = "security issue" }]'
+    ).entries[0]
+    cleared = parse_catalog(
+        'packages = [{ name = "sample-pkg", version = "1.0", yanked = false }]'
+    ).entries[0]
+
+    assert yanked.yanked_reason == "security issue"
+    assert not yanked.clear_yanked
+    assert cleared.yanked_reason is None
+    assert cleared.clear_yanked
+    with pytest.raises(MypypiError, match="requires yanked_reason"):
+        parse_catalog(
+            'packages = [{ name = "sample-pkg", version = "1.0", yanked = true }]'
+        )

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import sys
 import zipfile
 from base64 import urlsafe_b64encode
 from pathlib import Path
@@ -21,6 +22,7 @@ from mypypi.validate import (
     ValidationException,
     ValidationPolicy,
     _install_command,
+    _local_platform,
     _uv_environment,
     inspect_wheel,
     validate_wheel,
@@ -28,6 +30,9 @@ from mypypi.validate import (
 
 FIXTURES = Path(__file__).parent / "fixtures" / "wheels"
 TARGET = Target(Version("3.15"), "macos-arm64")
+HOST_PLATFORM = _local_platform()
+assert HOST_PLATFORM is not None
+HOST_TARGET = Target(Version("3.15"), HOST_PLATFORM)
 
 
 def make_wheel(
@@ -39,14 +44,20 @@ def make_wheel(
     requires_python: str = ">=3.15,<3.16",
     requires_dist: tuple[str, ...] = (),
     tag: str = "py3-none-any",
+    version: str = "1.0",
+    package_name: str = "validation-fixture",
+    dist_info_directory: str | None = None,
     record_override: bytes | None = None,
+    generator_headers: tuple[str, ...] = ("tests",),
 ) -> Path:
     path = directory / filename
-    dist_info = "validation_fixture-1.0.dist-info"
+    dist_info = dist_info_directory or (
+        f"{package_name.replace('-', '_')}-{version.replace('-', '_')}.dist-info"
+    )
     metadata = [
         "Metadata-Version: 2.4",
-        "Name: validation-fixture",
-        "Version: 1.0",
+        f"Name: {package_name}",
+        f"Version: {version}",
         f"Requires-Python: {requires_python}",
         *(f"Requires-Dist: {requirement}" for requirement in requires_dist),
         "",
@@ -60,7 +71,9 @@ def make_wheel(
         ),
         f"{dist_info}/METADATA": "\n".join(metadata).encode(),
         f"{dist_info}/WHEEL": (
-            f"Wheel-Version: 1.0\nGenerator: tests\nRoot-Is-Purelib: true\n"
+            "Wheel-Version: 1.0\n"
+            + "".join(f"Generator: {generator}\n" for generator in generator_headers)
+            + "Root-Is-Purelib: true\n"
             f"Tag: {tag}\n\n"
         ).encode(),
     }
@@ -89,6 +102,45 @@ def test_inspect_wheel_checks_identity_structure_tags_and_requires_python():
     assert not metadata.native_architectures
 
 
+def test_inspect_wheel_accepts_local_version_dist_info(tmp_path):
+    wheel = make_wheel(
+        tmp_path,
+        filename="validation_fixture-1.0+local-py3-none-any.whl",
+        version="1.0+local",
+    )
+
+    metadata = inspect_wheel(wheel, TARGET)
+
+    assert str(metadata.identity.package.version) == "1.0+local"
+
+
+def test_inspect_wheel_accepts_case_preserved_normalized_dist_info_name(tmp_path):
+    wheel = make_wheel(
+        tmp_path,
+        filename="PySocks-1.7.1-py3-none-any.whl",
+        version="1.7.1",
+        package_name="PySocks",
+        dist_info_directory="PySocks-1.7.1.dist-info",
+    )
+
+    metadata = inspect_wheel(wheel, TARGET)
+
+    assert metadata.identity.package == PackageVersion.parse("pysocks", "1.7.1")
+
+
+def test_inspect_wheel_accepts_generator_added_by_native_repair(tmp_path):
+    wheel = make_wheel(
+        tmp_path,
+        generator_headers=("setuptools (84.2.1)", "delocate 0.13.0"),
+    )
+
+    metadata = inspect_wheel(wheel, TARGET)
+
+    assert metadata.identity.package == PackageVersion.parse(
+        "validation-fixture", "1.0"
+    )
+
+
 @pytest.mark.parametrize(
     ("filename", "requires_python", "expected"),
     [
@@ -112,6 +164,20 @@ def test_inspect_wheel_rejects_wrong_identity_tags_and_python(
     )
     assert result.value.context.package == expected_package
     assert result.value.context.target == TARGET
+
+
+def test_inspect_wheel_uses_the_running_cpython_patch_version(tmp_path):
+    required = Version(
+        f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro + 1}"
+    )
+    wheel = make_wheel(
+        tmp_path,
+        requires_python=f">={required},<3.16",
+    )
+
+    actual = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+    with pytest.raises(MypypiError, match=f"Requires-Python excludes CPython {actual}"):
+        inspect_wheel(wheel, HOST_TARGET)
 
 
 def test_inspect_wheel_rejects_incomplete_or_unsafe_wheel(tmp_path):
@@ -148,9 +214,11 @@ def test_inspect_wheel_rejects_invalid_record_hashes_and_missing_files(
 
 
 def test_inspect_wheel_rejects_native_binary_for_wrong_architecture(tmp_path):
-    elf = bytearray(20)
-    elf[:6] = b"\x7fELF\x02\x01"
+    elf = bytearray(64)
+    elf[:7] = b"\x7fELF\x02\x01\x01"
     elf[18:20] = (62).to_bytes(2, "little")
+    elf[20:24] = (1).to_bytes(4, "little")
+    elf[52:54] = (64).to_bytes(2, "little")
     wheel = make_wheel(
         tmp_path,
         module="validation_fixture.abi3.so",
@@ -223,7 +291,6 @@ def test_validation_exception_requires_reason_and_names_one_exception():
         python=Path("/env/bin/python"),
         wheel=Path("/wheels/validation_fixture.whl"),
         wheel_set=Path("/wheels"),
-        index_url="https://curated.example/simple",
         policy=policy,
     )
     assert policy.extras == "speedups"
@@ -238,10 +305,20 @@ def test_uv_environment_cannot_add_an_unconfigured_package_index(monkeypatch):
     monkeypatch.setenv("UV_INDEX", "https://public.example/simple")
     monkeypatch.setenv("UV_EXTRA_INDEX_URL", "https://another.example/simple")
     monkeypatch.setenv("UV_INDEX_PYPI_URL", "https://named.example/simple")
+    monkeypatch.setenv("UV_NO_BUILD_ISOLATION", "1")
+    monkeypatch.setenv("UV_NO_VERIFY_HASHES", "1")
+    monkeypatch.setenv("PIP_TRUSTED_HOST", "packages.example")
+    monkeypatch.setenv("HTTPS_PROXY", "https://proxy.example")
+    monkeypatch.setenv("SSL_CERT_FILE", "/certificates/custom.pem")
     environment = _uv_environment()
     assert "UV_INDEX" not in environment
     assert "UV_EXTRA_INDEX_URL" not in environment
     assert "UV_INDEX_PYPI_URL" not in environment
+    assert "UV_NO_BUILD_ISOLATION" not in environment
+    assert "UV_NO_VERIFY_HASHES" not in environment
+    assert "PIP_TRUSTED_HOST" not in environment
+    assert environment["HTTPS_PROXY"] == "https://proxy.example"
+    assert environment["SSL_CERT_FILE"] == "/certificates/custom.pem"
 
 
 def test_runtime_install_is_limited_to_curated_index_wheels_and_binaries():
@@ -249,34 +326,23 @@ def test_runtime_install_is_limited_to_curated_index_wheels_and_binaries():
         python=Path("/env/bin/python"),
         wheel=Path("/wheels/validation_fixture.whl"),
         wheel_set=Path("/wheels"),
-        index_url="https://curated.example/simple",
         policy=ValidationPolicy(),
     )
     assert "--only-binary=:all:" in command
-    assert "--default-index=https://curated.example/simple" in command
-    assert "--index-strategy=first-index" in command
+    assert "--no-index" in command
     assert "--find-links=/wheels" in command
     assert not any("pypi.org" in argument for argument in command)
-    with pytest.raises(ValueError, match="public PyPI"):
-        _install_command(
-            python=Path("/env/bin/python"),
-            wheel=Path("/wheels/validation_fixture.whl"),
-            wheel_set=Path("/wheels"),
-            index_url="https://pypi.org/simple",
-            policy=ValidationPolicy(),
-        )
 
 
 def test_validate_wheel_installs_from_local_wheel_set_and_imports(
     tmp_path, monkeypatch
 ):
     wheel = FIXTURES / "validation_fixture-1.0-py3-none-any.whl"
-    monkeypatch.setenv("TMPDIR", "/Users/josh/dev/mypypi/.work/tmp")
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
     validated = validate_wheel(
         wheel,
-        target=TARGET,
+        target=HOST_TARGET,
         wheel_set=FIXTURES,
-        index_url="http://127.0.0.1:9/simple",
     )
     assert validated.imports == ("validation_fixture",)
 
@@ -286,18 +352,34 @@ def test_validate_wheel_fails_when_import_raises(tmp_path, monkeypatch):
         tmp_path,
         module_source="raise RuntimeError('broken import')\n",
     )
-    monkeypatch.setenv("TMPDIR", "/Users/josh/dev/mypypi/.work/tmp")
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
     monkeypatch.setenv("UV_HTTP_RETRIES", "0")
     with pytest.raises(MypypiError, match="import validation_fixture failed") as result:
         validate_wheel(
             wheel,
-            target=TARGET,
+            target=HOST_TARGET,
             wheel_set=tmp_path,
-            index_url="http://127.0.0.1:9/simple",
         )
     assert result.value.context.package == PackageVersion.parse(
         "validation-fixture", "1.0"
     )
+
+
+def test_import_probe_ignores_cwd_and_pythonpath(tmp_path, monkeypatch):
+    wheel = make_wheel(
+        tmp_path,
+        module_source="import ambient_only\nvalue = ambient_only.value\n",
+    )
+    (tmp_path / "ambient_only.py").write_text("value = 1\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PYTHONPATH", str(tmp_path))
+
+    with pytest.raises(MypypiError, match="import validation_fixture failed"):
+        validate_wheel(
+            wheel,
+            target=HOST_TARGET,
+            wheel_set=wheel.parent,
+        )
 
 
 def test_validate_wheel_skips_only_the_named_import(tmp_path, monkeypatch):
@@ -305,12 +387,11 @@ def test_validate_wheel_skips_only_the_named_import(tmp_path, monkeypatch):
         tmp_path,
         module_source="raise RuntimeError('broken import')\n",
     )
-    monkeypatch.setenv("TMPDIR", "/Users/josh/dev/mypypi/.work/tmp")
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
     validate_wheel(
         wheel,
-        target=TARGET,
+        target=HOST_TARGET,
         wheel_set=tmp_path,
-        index_url="http://127.0.0.1:9/simple",
         policy=ValidationPolicy(
             (
                 ValidationException(
@@ -328,13 +409,12 @@ def test_validate_wheel_fails_when_runtime_dependency_is_missing(tmp_path, monke
         tmp_path,
         requires_dist=("missing-runtime-dependency==8.1",),
     )
-    monkeypatch.setenv("TMPDIR", "/Users/josh/dev/mypypi/.work/tmp")
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
     monkeypatch.setenv("UV_HTTP_RETRIES", "0")
     with pytest.raises(MypypiError, match="dependency installation failed") as result:
         validate_wheel(
             wheel,
-            target=TARGET,
+            target=HOST_TARGET,
             wheel_set=tmp_path,
-            index_url="http://127.0.0.1:9/simple",
         )
-    assert result.value.context.target == TARGET
+    assert result.value.context.target == HOST_TARGET

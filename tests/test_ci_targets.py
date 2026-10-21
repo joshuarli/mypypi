@@ -15,7 +15,7 @@ def configured_platforms():
 def readme_platforms():
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     pattern = (
-        r"(?ms)^## Plan and build wheels\n.*?"
+        r"(?ms)^## Build wheels on native hosts\n.*?"
         r"^\| Platform \| Wheel OS floor \| Native build host \|\n(.*?)^\n"
     )
     section = re.search(pattern, readme)

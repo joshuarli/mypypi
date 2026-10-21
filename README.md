@@ -1,10 +1,10 @@
 # Build wheels for a local Python index
 
-`mypypi` plans, builds, validates, and publishes pinned package wheels to a local PEP 503 index. It has no registry server, account system, database, or remote publishing command. It supports CPython 3.15 only.
+`mypypi` resolves, acquires, builds, validates, and publishes wheels to a static PEP 503 index. It supports CPython 3.15 on Linux x86_64 and aarch64, and macOS x86_64 and arm64.
 
 ## Set up the project
 
-Install [uv](https://docs.astral.sh/uv/) and CPython 3.15. From the repository root, sync the locked developer environment:
+Install [uv](https://docs.astral.sh/uv/) and CPython 3.15. Run project commands from the repository root, or pass `--config` and `--catalog` with explicit paths.
 
 ```sh
 uv python install 3.15
@@ -12,31 +12,31 @@ uv sync --locked --python 3.15
 uv run --locked --python 3.15 mypypi --help
 ```
 
-`uv_build` builds the CLI. `uv` manages the developer environment, resolves package dependencies, builds upstream source archives, and creates isolated validation environments. `packaging` parses package names, versions, and wheel tags.
+Use `uv sync --locked --python 3.15 --group repair-macos` when you build native macOS wheels. Use `--group repair-linux` on Linux. Linux repair also requires `patchelf` and `readelf` on `PATH`.
 
-## Add package pins
+## Add and plan package pins
 
-`packages.toml` stores exact package pins and optional, reasoned exceptions. Add a package and its resolved dependencies for every configured platform with:
+Add an exact root pin. `add` resolves dependencies for each configured target and records platform applicability on transitive pins.
 
 ```sh
-uv run --locked --python 3.15 mypypi --catalog packages.toml --state-dir .mypypi add "packaging==26.3"
+uv run --locked --python 3.15 mypypi --config pyproject.toml --catalog packages.toml --state-dir .mypypi add "idna==3.10"
+uv run --locked --python 3.15 mypypi --config pyproject.toml --catalog packages.toml --state-dir .mypypi plan --output ./wheel-index --platform macos-arm64
 ```
 
-The CLI writes resolved pins to `packages.toml`. You can also edit the file directly:
+Keep multiple versions as separate `[[packages]]` entries. A transitive pin can apply to selected targets:
 
 ```toml
 [[packages]]
-name = "packaging"
-version = "26.3"
+name = "example-dependency"
+version = "2.0"
+platforms = ["macos-arm64"]
 ```
 
-Keep multiple versions as separate `[[packages]]` entries. `likely_binary_ignore` maps source archive paths to reasons. `custom_prebuild` maps commands containing `{prefix}` to reasons. Each command must write under that temporary prefix. The `validation` table supports `validate_extras`, `validate_incorrect_missing_deps`, and `validate_skip_imports`. Those keys map an extra, requirement, or import name to a reason. `exclude_platforms` maps a platform to a reason. `yanked_reason` records why a yanked release is allowed. The publisher preserves that reason in the local index. Every exception needs a non-empty reason. See [security and build limits](docs/security-and-reproducibility.md) before adding build commands.
+`exclude_platforms` maps exceptional platform names to reasons. The full target list and the Linux repair floor live in `[tool.mypypi.targets]` in `pyproject.toml`.
 
-`--catalog` and `--state-dir` are global options. Put them before the subcommand. Put command-specific options after the subcommand.
+## Build wheels on native hosts
 
-## Plan and build wheels
-
-The platform list and Linux repair policy come from `[tool.mypypi.targets]` in `pyproject.toml`. The supported platforms are:
+Run `build` on a host matching the selected platform when source compilation is needed. The command tries compatible upstream wheels in preference order, then tries each available source archive. It reports the filename and whether it came from an upstream wheel or a source build.
 
 | Platform | Wheel OS floor | Native build host |
 | --- | --- | --- |
@@ -45,58 +45,52 @@ The platform list and Linux repair policy come from `[tool.mypypi.targets]` in `
 | `macos-x86_64` | macOS 15.0 | macOS x86_64 |
 | `macos-arm64` | macOS 15.0 | macOS arm64 |
 
-`--platform` selects one configured target. Repeat it to select more than one. `plan` checks upstream metadata and local wheels. `build` downloads compatible wheels or builds from a source archive when needed.
+Commands report the selected executable, full CPython patch version, ABI, and platform. Native builds and import validation use that interpreter and enforce its full patch version against `Requires-Python`. When resolving or checking a different target, the patch is unknown, so `mypypi` uses CPython 3.15.0 as the conservative baseline.
 
 ```sh
-uv run --locked --python 3.15 mypypi --catalog packages.toml --state-dir .mypypi plan --output ./wheel-index --platform macos-arm64
-uv run --locked --python 3.15 mypypi --catalog packages.toml --state-dir .mypypi build --output ./wheel-index --platform macos-arm64
+uv run --locked --python 3.15 mypypi --config pyproject.toml --catalog packages.toml --state-dir .mypypi build --output ./wheel-index --platform macos-arm64
 ```
 
-Build source archives on a matching native host. Linux wheels target `manylinux_2_28`. `pyproject.toml` records pinned manylinux image tags and digests, but `mypypi` does not launch those images. See [security and build limits](docs/security-and-reproducibility.md) before using a container builder.
+Linux native builds require a matching Linux architecture host with a manylinux 2.28 compatible userspace. `auditwheel` checks and repairs the final policy. A newer Linux host does not establish that policy by itself. `mypypi` does not launch containers or select builder images. Prepare the matching builder with CPython 3.15, uv, `auditwheel`, `patchelf`, and `readelf` before building.
 
-Set `BUILD_INDEX` to the HTTPS URL for your curated build index before running this example:
+Build dependencies use public PyPI over HTTPS by default. Use `--build-index` with `--strict-build-deps` for a curated remote index. Strict builds also accept an absolute local `file://` index or loopback HTTP index. `--build-constraints` resolves its path from the directory where you invoke `mypypi`. Relative script paths in `custom_prebuild` use that same directory. Each command receives a temporary `{prefix}` path for generated headers and libraries.
+
+## Validate and publish
+
+Validation builds one candidate snapshot from retained published wheels and selected staged wheels. It applies package target applicability and exclusions, checks every selected catalog obligation, and resolves runtime dependencies only from that snapshot. It creates a fresh CPython 3.15 environment, installs wheels only, and runs imports from an isolated interpreter in a neutral directory. Validation runs on a native host for each selected target.
 
 ```sh
-uv run --locked --python 3.15 mypypi --catalog packages.toml --state-dir .mypypi build --output ./wheel-index --platform macos-arm64 --build-index "$BUILD_INDEX" --strict-build-deps --build-constraints build-constraints.txt --require-build-hashes
+uv run --locked --python 3.15 mypypi --config pyproject.toml --catalog packages.toml --state-dir .mypypi validate --output ./wheel-index --platform macos-arm64
+uv run --locked --python 3.15 mypypi --config pyproject.toml --catalog packages.toml --state-dir .mypypi publish --output ./wheel-index --platform macos-arm64
 ```
 
-By default, build dependencies come from `https://pypi.org/simple`. `--strict-build-deps` rejects public PyPI hosts and requires a curated build index. `--build-constraints` passes a constraints file to `uv build`. `--require-build-hashes` asks uv to require hashes for build requirements. Runtime validation does not use this build index.
+The first publish can start with an empty output directory. Stage the full selected runtime dependency closure or publish the dependencies first. A catalog entry with no wheel or reasoned exclusion fails validation and publication.
 
-## Validate and publish locally
+## Serve and install the index
 
-Start a local HTTP server bound to loopback. Keep it running while you validate and publish. The server exposes the `current` generation after the first publish.
+The publisher writes an explicit project list at `current/simple/index.html`. It stores wheels under `wheels/` and promotes complete immutable generations through the relative `current` symlink. Generated wheel links work at the origin root, below a path prefix, and through retained generation URLs.
 
 ```sh
-mkdir -p ./wheel-index
-python3.15 -m http.server --bind 127.0.0.1 --directory ./wheel-index 8000
+uv run --locked --python 3.15 python -m http.server --bind 127.0.0.1 --directory ./wheel-index 8000
 ```
 
-In another terminal, validate the staged wheels against the curated runtime index and publish them to a local directory:
-
-```sh
-uv run --locked --python 3.15 mypypi --catalog packages.toml --state-dir .mypypi validate --index-url http://127.0.0.1:8000/current/simple --platform macos-arm64
-uv run --locked --python 3.15 mypypi --catalog packages.toml --state-dir .mypypi publish --output ./wheel-index --index-url http://127.0.0.1:8000/current/simple --platform macos-arm64
-```
-
-Run validation on a native host that matches the selected platform. Validation uses only the supplied index and the staged wheel set. It installs wheels only, creates a fresh CPython 3.15 environment, and imports discovered modules. It never falls back to public PyPI or builds runtime dependencies from source. Stage the full dependency closure or publish dependencies to the curated index first.
-
-Create a consumer environment and install from the local index:
+In another terminal, install a published pin:
 
 ```sh
 uv venv --python 3.15 .consumer
-uv pip install --python .consumer/bin/python --only-binary=:all: --default-index http://127.0.0.1:8000/current/simple --index-strategy first-index "packaging==26.3"
+uv pip install --python .consumer/bin/python --only-binary=:all: --default-index http://127.0.0.1:8000/current/simple --index-strategy first-index "idna==3.10"
 ```
 
-The publisher stores immutable wheels and atomically switches the relative `current` symlink after it writes a complete index generation. Identical republishing is a no-op. A filename collision with different bytes fails.
+Identical publication is a no-op. Different bytes under a published wheel filename are a conflict. An unrelated publication preserves historical yanked reasons. Set `yanked = false` on a current catalog entry to clear that wheel's yanked state explicitly.
 
 ## Run checks
 
+Unit and loopback fixture tests do not need public PyPI. The marked resolver smoke test intentionally resolves an extra against PyPI.
+
 ```sh
 uv run --locked --python 3.15 ruff check src tests
-uv run --locked --python 3.15 pytest -q tests
-uv run --locked --python 3.15 pytest -q tests/test_ci_targets.py
+uv run --locked --python 3.15 pytest -q -m "not network" tests
+uv run --locked --python 3.15 pytest -q -m network tests/integration/test_uv_resolution.py
 ```
 
-The GitHub Actions workflows run lint and tests with read-only repository permissions on Ubuntu x86_64. They do not build wheels for every configured platform, publish packages, or upload artifacts. The target drift test checks the README platform list against `pyproject.toml`. The project includes the upstream Apache-2.0 license and copyright notice in [LICENSE](LICENSE).
-
-Read [security and build limits](docs/security-and-reproducibility.md) before building third-party source archives or serving an index to other machines.
+The workflows run lint and tests on Linux x86_64 and aarch64 and macOS x86_64 and arm64. They use read-only repository permissions and do not publish packages. See [security and build limits](docs/security-and-reproducibility.md) before building untrusted source. The project includes the upstream Apache-2.0 license and attribution.

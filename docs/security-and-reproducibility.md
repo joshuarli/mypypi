@@ -1,23 +1,31 @@
 # Security and build limits
 
-`mypypi` creates a local static package index. It does not provide authentication, authorization, TLS termination, or remote publication. The documented HTTP server binds to loopback. Put a separate, access-controlled HTTPS service in front of the index if other machines need access.
+`mypypi` writes a static package index. It does not provide authentication, authorization, TLS termination, or remote publishing. The README's HTTP server binds to loopback. Put a separate access-controlled HTTPS service in front of the index when other machines need access.
 
-## Build dependencies and source archives
+## Code execution
 
-`add` resolves exact package pins through uv against public PyPI. `build` uses public PyPI over HTTPS for build requirements by default. Use `--build-index` with `--strict-build-deps` to require a curated build index. Use `--build-constraints` to constrain build requirements and `--require-build-hashes` to require hashes where uv supports them.
+`uv build` executes the upstream PEP 517 backend from a downloaded source archive. Runtime validation installs wheels and imports discovered modules. Both operations execute third-party code. Environment cleanup is not a sandbox. Run them only for trusted packages and keep credentials off the build and validation host.
 
-`uv build` runs the upstream PEP 517 backend from a downloaded source archive. That backend can execute arbitrary code. `mypypi` does not sandbox it. Build only trusted source or run the command in a disposable, isolated builder with no sensitive credentials. Use a builder that matches the target platform when compiling native extensions.
+Package-specific `custom_prebuild` commands also execute on the host. Relative script paths use the directory where you invoke `mypypi`. Commands receive a temporary `{prefix}` for generated headers and libraries, but the tool does not enforce that writes stay there. Do not use the setting to install or remove host packages.
 
-Package-specific `custom_prebuild` commands also execute on the build host. Each command must write under the temporary `{prefix}` directory. The setting does not enforce that boundary. These commands must not install or remove host packages.
+## Package sources
 
-Runtime validation has a narrower source policy. It uses only the selected curated index and the staged wheel set. It rejects source distributions, public PyPI, and non-loopback HTTP indexes. A missing runtime dependency fails validation unless you stage the dependency wheel or publish it to the curated index.
+`add` resolves exact pins against public PyPI. Wheel and source downloads require HTTPS, verify PyPI's SHA-256 digest, and reject HTTPS redirects that downgrade to HTTP or add URL credentials. A release that returns 404 uses bounded exponential retry for up to one hour. Each socket operation and subprocess has a timeout. Timeout or cancellation stops the subprocess group.
 
-## Platform and reproducibility limits
+Source builds use public PyPI over HTTPS by default. `--strict-build-deps` requires a non-public HTTPS index, an absolute local `file://` index, or a loopback HTTP index. Runtime validation ignores ambient indexes and installs only binary wheels from the local candidate snapshot. It never falls back to public PyPI or builds runtime dependencies from source.
 
-The supported targets are the four platforms listed in the README. macOS wheels target macOS 15.0 or newer. Validation runs only on a native matching host. The CLI also requires the current host to match a target when it builds an sdist. It has no container launcher or cross-compilation setting. Run it inside a matching builder when you use a container. `uv build` alone does not cross-compile extensions.
+The command policy removes ambient uv and pip index, constraint, override, build-isolation, hash-verification, and insecure-host settings. It preserves proxy, certificate, interpreter-download, and uv cache settings. This protects command policy from user environment overrides; it does not isolate downloaded code.
 
-The configured GitHub Actions workflows run lint and tests on Ubuntu x86_64. They do not prove that wheel builds or validation work on the other targets. Use a native builder for each platform you release.
+## Target compatibility
 
-`mypypi` verifies downloaded wheel hashes and keeps published wheel filenames immutable. It does not guarantee bit-for-bit reproducible upstream builds. Build backends, toolchains, and source archives can change. Use a pinned source release, a controlled builder, build constraints, and hashes when your build requirements support them. The project lock file covers the CLI development environment, not every upstream package build.
+The project supports CPython 3.15 only. Builds and imports use the selected CPython executable. Native validation checks the full running patch version against `Requires-Python` and reports its executable, ABI, and platform. Cross-target resolution uses CPython 3.15.0 as its conservative patch baseline and requires later validation on the target's native runner.
 
-The generated index is a static directory tree. It has no background service, remote deployment path, or automatic cleanup policy for published generations.
+Linux targets require manylinux 2.28-compatible output. `auditwheel` must verify and repair native wheels. Build source on a matching Linux architecture with a manylinux 2.28 compatible userspace. A newer Linux host or matching CPU alone does not prove the policy. `mypypi` does not launch containers. Provision `auditwheel`, `patchelf`, and `readelf` in the external builder. On macOS, `delocate` repairs native wheels and the final wheel must retain the macOS 15.0 deployment floor.
+
+GitHub Actions runs tests on Linux x86_64 and aarch64 and macOS x86_64 and arm64. Those jobs do not establish bit-for-bit reproducibility. The lock file covers the CLI environment, not every upstream build backend or compiler.
+
+## Published state
+
+Wheels are immutable by filename and SHA-256. Generations contain deterministic HTML and a manifest of wheel and metadata hashes. The publisher merges the current manifest while holding its process lock, then atomically promotes a complete generation. Old generations remain available at their generation URL. Place the output directory under any URL prefix; project pages link to the wheel directory through that same generation URL.
+
+Historical yanked reasons persist when a catalog entry is absent or omits yanked policy. Set `yanked = false` explicitly to clear a prior yanked state. A different wheel's publication does not change it.

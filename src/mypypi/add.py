@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import fcntl
+import json
 import os
 import re
 import secrets
 import stat
 import subprocess
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
+from packaging.requirements import InvalidRequirement, Requirement
 from packaging.version import Version
 
 from .catalog import Catalog, parse_catalog
@@ -20,14 +23,21 @@ from .models import (
     PackageVersion,
     Target,
 )
+from .platforms import target_python_version
+from .process_policy import run_process, uv_environment
 
 _PYTHON_PLATFORMS = {
-    "linux-x86_64": "x86_64-unknown-linux-gnu",
-    "linux-aarch64": "aarch64-unknown-linux-gnu",
+    "linux-x86_64": "x86_64-manylinux_2_28",
+    "linux-aarch64": "aarch64-manylinux_2_28",
     "macos-x86_64": "x86_64-apple-darwin",
     "macos-arm64": "aarch64-apple-darwin",
 }
-_PIN = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]*)==([^=<>!~\s]+)$")
+
+
+@dataclass(frozen=True, slots=True)
+class _ResolvedPin:
+    package: PackageVersion
+    platforms: tuple[str, ...] | None
 
 
 def _dependency_error(detail: str, cause: Exception | None = None) -> MypypiError:
@@ -41,24 +51,42 @@ def _dependency_error(detail: str, cause: Exception | None = None) -> MypypiErro
     return error
 
 
-def parse_pins(requirements: Sequence[str]) -> tuple[PackageVersion, ...]:
+def _parse_exact_requirements(
+    requirements: Sequence[str],
+) -> tuple[tuple[PackageVersion, ...], tuple[str, ...]]:
     packages = []
+    source = []
     for requirement in requirements:
-        match = _PIN.fullmatch(requirement.strip())
-        if match is None:
+        try:
+            parsed = Requirement(requirement.strip())
+        except InvalidRequirement as cause:
+            raise MypypiError(
+                ErrorKind.INVALID_INPUT,
+                f"requirement must be an exact name==version pin: {requirement!r}",
+                FailureContext(FailureStage.COMMAND),
+            ) from cause
+        specifiers = tuple(parsed.specifier)
+        if (
+            parsed.url is not None
+            or parsed.marker is not None
+            or len(specifiers) != 1
+            or specifiers[0].operator != "=="
+            or "*" in specifiers[0].version
+        ):
             raise MypypiError(
                 ErrorKind.INVALID_INPUT,
                 f"requirement must be an exact name==version pin: {requirement!r}",
                 FailureContext(FailureStage.COMMAND),
             )
         try:
-            packages.append(PackageVersion.parse(match.group(1), match.group(2)))
+            packages.append(PackageVersion.parse(parsed.name, specifiers[0].version))
         except ValueError as cause:
             raise MypypiError(
                 ErrorKind.INVALID_INPUT,
                 f"invalid exact pin {requirement!r}",
                 FailureContext(FailureStage.COMMAND),
             ) from cause
+        source.append(requirement.strip())
     if not packages:
         raise MypypiError(
             ErrorKind.INVALID_INPUT,
@@ -75,7 +103,12 @@ def parse_pins(requirements: Sequence[str]) -> tuple[PackageVersion, ...]:
                 f"conflicting requested pins for {name}: {', '.join(map(str, sorted(versions)))}",
                 FailureContext(FailureStage.COMMAND),
             )
-    return tuple(dict.fromkeys(packages))
+    return tuple(dict.fromkeys(packages)), tuple(source)
+
+
+def parse_pins(requirements: Sequence[str]) -> tuple[PackageVersion, ...]:
+    packages, _ = _parse_exact_requirements(requirements)
+    return packages
 
 
 def _parse_compiled(output: str) -> tuple[PackageVersion, ...]:
@@ -84,13 +117,26 @@ def _parse_compiled(output: str) -> tuple[PackageVersion, ...]:
         line = line.strip()
         if not line or line.startswith("#"):
             continue
-        match = _PIN.fullmatch(line)
-        if match is None:
+        try:
+            requirement = Requirement(line)
+        except InvalidRequirement as cause:
+            raise _dependency_error(
+                f"uv returned an invalid pinned requirement: {line!r}", cause
+            ) from cause
+        specifiers = tuple(requirement.specifier)
+        if (
+            requirement.url is not None
+            or len(specifiers) != 1
+            or specifiers[0].operator != "=="
+            or "*" in specifiers[0].version
+        ):
             raise _dependency_error(
                 f"uv returned an invalid pinned requirement: {line!r}"
             )
         try:
-            resolved.append(PackageVersion.parse(match.group(1), match.group(2)))
+            resolved.append(
+                PackageVersion.parse(requirement.name, specifiers[0].version)
+            )
         except ValueError as cause:
             raise _dependency_error(
                 f"uv returned an invalid pinned requirement: {line!r}", cause
@@ -102,7 +148,7 @@ def compile_for_target(
     requirements: Sequence[str],
     target: Target,
     python: str,
-    run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    run: Callable[..., subprocess.CompletedProcess[str]] = run_process,
 ) -> tuple[PackageVersion, ...]:
     platform = _PYTHON_PLATFORMS.get(target.platform)
     if platform is None:
@@ -116,7 +162,7 @@ def compile_for_target(
         "--no-header",
         "--no-annotate",
         f"--python={python}",
-        f"--python-version={target.python_version}",
+        f"--python-version={target_python_version(target)}",
         f"--python-platform={platform}",
         "--default-index=https://pypi.org/simple",
         "-",
@@ -128,7 +174,13 @@ def compile_for_target(
             text=True,
             capture_output=True,
             check=True,
+            env=uv_environment(),
+            timeout=300,
         )
+    except subprocess.TimeoutExpired as cause:
+        raise _dependency_error(
+            f"uv dependency resolution timed out for {target.platform}", cause
+        ) from cause
     except (OSError, subprocess.CalledProcessError) as cause:
         raise _dependency_error(
             f"uv dependency resolution failed for {target.platform}", cause
@@ -140,55 +192,123 @@ def resolve_dependencies(
     requirements: Sequence[str],
     targets: Sequence[Target],
     python: str,
-    run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    run: Callable[..., subprocess.CompletedProcess[str]] = run_process,
 ) -> tuple[PackageVersion, ...]:
-    pins = parse_pins(requirements)
-    resolutions = [
-        compile_for_target(requirements, target, python, run) for target in targets
-    ]
-    versions: dict[str, set[str]] = {}
-    for resolution in resolutions:
+    return tuple(
+        pin.package
+        for pin in _resolve_dependencies(requirements, targets, python, run)
+    )
+
+
+def _resolve_dependencies(
+    requirements: Sequence[str],
+    targets: Sequence[Target],
+    python: str,
+    run: Callable[..., subprocess.CompletedProcess[str]],
+) -> tuple[_ResolvedPin, ...]:
+    pins, normalized_requirements = _parse_exact_requirements(requirements)
+    resolutions: list[tuple[Target, tuple[PackageVersion, ...]]] = []
+    for target in targets:
+        resolution = compile_for_target(normalized_requirements, target, python, run)
+        by_name: dict[str, set[Version]] = {}
         for package in resolution:
-            versions.setdefault(package.name, set()).add(str(package.version))
-    conflicts = {name: found for name, found in versions.items() if len(found) > 1}
-    if conflicts:
-        name, found = sorted(conflicts.items())[0]
-        raise MypypiError(
-            ErrorKind.CONFLICT,
-            "dependency resolution conflicts across configured platforms for "
-            f"{name}: {', '.join(sorted(found))}",
-            FailureContext(FailureStage.PLANNING),
-        )
-    for pin in pins:
-        found = versions.get(pin.name, set())
-        if found and found != {str(pin.version)}:
+            by_name.setdefault(package.name, set()).add(package.version)
+        conflicts = {
+            name: found for name, found in by_name.items() if len(found) > 1
+        }
+        if conflicts:
+            name, found = sorted(conflicts.items())[0]
+            package = PackageVersion(name, min(found))
             raise MypypiError(
                 ErrorKind.CONFLICT,
-                f"resolved dependency conflicts with requested pin {pin.name}=={pin.version}",
-                FailureContext(FailureStage.PLANNING, package=pin),
+                f"dependency resolution conflicts for {name} on {target.platform}: "
+                f"{', '.join(map(str, sorted(found)))}",
+                FailureContext(FailureStage.PLANNING, package, target),
             )
-    for pin in pins:
-        versions.setdefault(pin.name, {str(pin.version)})
+        resolved_by_name = {
+            package.name: package.version for package in resolution
+        }
+        for pin in pins:
+            resolved = resolved_by_name.get(pin.name)
+            if resolved is not None and resolved != pin.version:
+                raise MypypiError(
+                    ErrorKind.CONFLICT,
+                    f"resolved dependency conflicts with requested pin "
+                    f"{pin.name}=={pin.version} on {target.platform}: {resolved}",
+                    FailureContext(FailureStage.PLANNING, pin, target),
+                )
+        resolutions.append((target, resolution))
+
+    root_names = {pin.name for pin in pins}
+    transitive_targets: dict[PackageVersion, list[str]] = {}
+    for target, resolution in resolutions:
+        for package in resolution:
+            if package.name in root_names:
+                continue
+            platforms = transitive_targets.setdefault(package, [])
+            if target.platform not in platforms:
+                platforms.append(target.platform)
+
+    resolved = [_ResolvedPin(pin, None) for pin in pins]
+    resolved.extend(
+        _ResolvedPin(package, tuple(platforms))
+        for package, platforms in transitive_targets.items()
+    )
     return tuple(
-        PackageVersion(name, Version(next(iter(found))))
-        for name, found in sorted(versions.items())
+        sorted(
+            resolved,
+            key=lambda pin: (pin.package.name, pin.package.version),
+        )
     )
 
 
 def append_entries(
-    source: str, packages: Sequence[PackageVersion], existing: Catalog
+    source: str,
+    packages: Sequence[PackageVersion | _ResolvedPin],
+    existing: Catalog,
 ) -> str:
-    present = {entry.package for entry in existing.entries}
-    additions = [package for package in packages if package not in present]
+    present = {entry.package: entry for entry in existing.entries}
+    requested: dict[PackageVersion, set[str] | None] = {}
+    for item in packages:
+        package = item if isinstance(item, PackageVersion) else item.package
+        platforms = None if isinstance(item, PackageVersion) else item.platforms
+        if package not in requested:
+            requested[package] = None if platforms is None else set(platforms)
+        elif requested[package] is not None:
+            if platforms is None:
+                requested[package] = None
+            else:
+                requested[package].update(platforms)
+    additions: list[tuple[PackageVersion, tuple[str, ...] | None]] = []
+    for package, platforms in requested.items():
+        current = present.get(package)
+        if current is not None and current.platforms is None:
+            continue
+        if platforms is None:
+            additions.append((package, None))
+            continue
+        current_platforms = set(current.platforms) if current is not None else set()
+        missing = tuple(
+            platform for platform in platforms if platform not in current_platforms
+        )
+        if missing:
+            additions.append((package, missing))
     if not additions:
         return source
     source = re.sub(r"(?m)^packages\s*=\s*\[\]\s*(?=#|$)", "", source, count=1)
     separator = "" if not source or source.endswith("\n") else "\n"
-    rows = "".join(
-        f'\n[[packages]]\nname = "{package.name}"\nversion = "{package.version}"\n'
-        for package in additions
-    )
-    return f"{source}{separator}{rows}"
+    rows = []
+    for package, platforms in additions:
+        row = (
+            f'\n[[packages]]\nname = "{package.name}"\n'
+            f'version = "{package.version}"\n'
+        )
+        if platforms is not None:
+            row += f"platforms = {json.dumps(platforms)}\n"
+        rows.append(row)
+    updated = f"{source}{separator}{''.join(rows)}"
+    parse_catalog(updated)
+    return updated
 
 
 def add_packages(
@@ -196,18 +316,19 @@ def add_packages(
     requirements: Sequence[str],
     targets: Sequence[Target],
     python: str,
-    run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    run: Callable[..., subprocess.CompletedProcess[str]] = run_process,
 ) -> tuple[PackageVersion, ...]:
     initial = _read_catalog(path)
     parse_catalog(initial)
-    resolved = resolve_dependencies(requirements, targets, python, run)
+    resolved = _resolve_dependencies(requirements, targets, python, run)
     with _CatalogLock(path):
         source = _read_catalog(path)
         existing = parse_catalog(source)
         updated = append_entries(source, resolved, existing)
+        parse_catalog(updated)
         if updated != source:
             _replace_catalog(path, updated)
-    return resolved
+    return tuple(pin.package for pin in resolved)
 
 
 def _read_catalog(path: Path) -> str:
@@ -260,16 +381,7 @@ class _CatalogLock:
                 os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW,
                 0o600,
             )
-            fcntl.flock(self.descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as cause:
-            if self.descriptor is not None:
-                os.close(self.descriptor)
-                self.descriptor = None
-            raise MypypiError(
-                ErrorKind.CONFLICT,
-                "another add command is updating the catalog",
-                FailureContext(FailureStage.CONFIGURATION),
-            ) from cause
+            fcntl.flock(self.descriptor, fcntl.LOCK_EX)
         except OSError as cause:
             if self.descriptor is not None:
                 os.close(self.descriptor)

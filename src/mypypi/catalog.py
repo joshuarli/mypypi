@@ -36,6 +36,8 @@ class PackageEntry:
     validation: ValidationSettings
     excluded_platforms: tuple[tuple[str, str], ...]
     yanked_reason: str | None = None
+    platforms: tuple[str, ...] | None = None
+    clear_yanked: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,6 +78,37 @@ def _reason_map(value: Any, label: str) -> tuple[tuple[str, str], ...]:
     return tuple(sorted(pairs))
 
 
+def _ordered_reason_map(value: Any, label: str) -> tuple[tuple[str, str], ...]:
+    if not isinstance(value, dict):
+        raise _error(f"{label} must map each exception to a reason")
+    pairs = []
+    for key, reason in value.items():
+        if not isinstance(key, str) or not key.strip():
+            raise _error(f"{label} keys must be non-empty strings")
+        if not isinstance(reason, str) or not reason.strip():
+            raise _error(f"{label} requires a non-empty reason for {key}")
+        pairs.append((key, reason))
+    return tuple(pairs)
+
+
+def _platforms(value: Any, label: str) -> tuple[str, ...] | None:
+    if value is None:
+        return None
+    if (
+        not isinstance(value, list)
+        or not value
+        or not all(
+            isinstance(platform, str)
+            and platform
+            and platform.strip() == platform
+            for platform in value
+        )
+    ):
+        raise _error(f"{label} must be a non-empty array of platform names")
+    if len(set(value)) != len(value):
+        raise _error(f"{label} platform names must be unique")
+    return tuple(value)
+
 
 def _entry(value: Any) -> PackageEntry:
     row = _mapping(
@@ -87,7 +120,9 @@ def _entry(value: Any) -> PackageEntry:
             "build",
             "validation",
             "exclude_platforms",
+            "platforms",
             "yanked_reason",
+            "yanked",
         },
     )
     name = row.get("name")
@@ -113,7 +148,7 @@ def _entry(value: Any) -> PackageEntry:
         build_row.get("likely_binary_ignore", {}),
         f"{package} likely_binary_ignore",
     )
-    custom_prebuild = _reason_map(
+    custom_prebuild = _ordered_reason_map(
         build_row.get("custom_prebuild", {}), f"{package} custom_prebuild"
     )
     if custom_prebuild and not all(
@@ -150,12 +185,53 @@ def _entry(value: Any) -> PackageEntry:
         not isinstance(yanked_reason, str) or not yanked_reason.strip()
     ):
         raise _error(f"{package}: yanked_reason must be non-empty")
+    yanked = row.get("yanked")
+    if yanked is not None and type(yanked) is not bool:
+        raise _error(f"{package}: yanked must be true or false")
+    if yanked is True and yanked_reason is None:
+        raise _error(f"{package}: yanked = true requires yanked_reason")
+    if yanked is False and yanked_reason is not None:
+        raise _error(f"{package}: yanked = false cannot include yanked_reason")
+    platforms = _platforms(row.get("platforms"), f"{package} platforms")
     return PackageEntry(
         package,
         BuildSettings(likely_binary_ignore, custom_prebuild),
         validation,
         exclusions,
         yanked_reason,
+        platforms,
+        yanked is False,
+    )
+
+
+def _merge_entries(first: PackageEntry, second: PackageEntry) -> PackageEntry:
+    if (
+        first.build != second.build
+        or first.validation != second.validation
+        or first.excluded_platforms != second.excluded_platforms
+        or first.yanked_reason != second.yanked_reason
+        or first.clear_yanked != second.clear_yanked
+    ):
+        raise _error(f"catalog has conflicting settings for {first.package}")
+    if first.platforms is None and second.platforms is None:
+        raise _error("catalog contains a duplicate package version")
+    if first.platforms is None or second.platforms is None:
+        platforms = None
+    else:
+        overlap = set(first.platforms) & set(second.platforms)
+        if overlap:
+            raise _error(
+                f"catalog contains a duplicate package version for {sorted(overlap)[0]}"
+            )
+        platforms = (*first.platforms, *second.platforms)
+    return PackageEntry(
+        first.package,
+        first.build,
+        first.validation,
+        first.excluded_platforms,
+        first.yanked_reason,
+        platforms,
+        first.clear_yanked,
     )
 
 
@@ -172,8 +248,14 @@ def parse_catalog(source: str) -> Catalog:
     rows = document["packages"]
     if not isinstance(rows, list):
         raise _error("packages must be an array of tables")
-    entries = tuple(_entry(row) for row in rows)
-    identities = [entry.package for entry in entries]
-    if len(set(identities)) != len(identities):
-        raise _error("catalog contains a duplicate package version")
-    return Catalog(entries)
+    entries: list[PackageEntry] = []
+    positions: dict[PackageVersion, int] = {}
+    for row in rows:
+        entry = _entry(row)
+        position = positions.get(entry.package)
+        if position is None:
+            positions[entry.package] = len(entries)
+            entries.append(entry)
+        else:
+            entries[position] = _merge_entries(entries[position], entry)
+    return Catalog(tuple(entries))

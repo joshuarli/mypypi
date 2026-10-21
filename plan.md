@@ -1,6 +1,8 @@
 # Build a minimal, uv-native Python wheel factory
 
-Status: complete with explicit review-tool and platform limitations.
+Status: follow-up implementation and local verification complete; four-runner CI execution is pending.
+
+Follow-up checkpoint: work started from clean base `7717bef804c0fb25c03b093de78d1334c566e015`. The baseline had 113 local passes and nine failures in GitHub Actions run 39642967141, caused by tests requesting macOS arm64 on Ubuntu and developer-specific TMPDIR paths. The final tree preserves CPython 3.15 only and passes local verification on macOS arm64. The Linux x86_64/aarch64 and macOS x86_64 runner jobs have not run against this follow-up; keep platform acceptance open until they pass.
 
 ## Goal
 
@@ -140,7 +142,7 @@ After P0, launch the four disjoint feature workstreams together when capacity al
 | Local installation | tests/integration/test_local_index.py::test_uv_installs_from_local_index builds a real wheel with uv, serves the static index on loopback, installs only from that index into a fresh environment, imports the package, then republishes without changing existing wheel bytes. |
 | Failures and reports | CLI tests cover missing sources, invalid config, integrity failures, build failure, validation failure, publication conflict, nonzero exit, and diagnostics naming package, version, Python, platform, and stage. |
 | CI and docs | uv run --locked --python 3.15 pytest -q tests/test_ci_targets.py checks workflow platforms against the configured targets. README commands pass locally. Pull-request workflows do not publish or upload artifacts and have read-only permissions. |
-| Completion | Full tests, lint, README examples, local end-to-end test, and available platform checks pass. The final report names any platform that could not be tested. |
+| Completion | Full tests, lint, README examples, installed-CLI end-to-end test, and available native checks pass. The four runner jobs must pass before platform acceptance closes. The final report names any platform that could not be tested. |
 
 Use synthetic package fixtures for ordinary tests. Keep the unit suite independent of external network access. The end-to-end test uses loopback only and runs offline after setup. Test real compiled-wheel behavior on each supported builder that is available.
 
@@ -199,6 +201,8 @@ Append one short dated line for each judgment that changes a contract or settles
 2026-10-21: Set Ruff's line length to 120 to keep project and test code readable without introducing unrelated reflow; use Python 3.15 lint rules.
 2026-10-21: Keep the staging owner marker through generation promotion and remove it afterward so crashes on either side of the atomic rename remain recoverable.
 2026-10-21: Remove the unused `native_architectures` helper and `ErrorKind.CANCELLED`; interruption already maps directly to CLI status 130, so neither internal path had a caller.
+2026-10-21: Keep target-conditioned transitive pins in the catalog's `platforms` field, and clear historical yanked state only through explicit `yanked = false`; ordinary environment applicability and exceptional exclusions stay separate.
+2026-10-21: Add global `--config` for repository-independent CLI use, use a local candidate wheel snapshot for runtime validation, and use CPython 3.15.0 as the unknown-patch cross-target baseline while native execution checks the full selected patch.
 
 ## Campaign log
 
@@ -209,6 +213,7 @@ Append one short line at the end of each phase. Include the checks run and any p
 2026-10-21 P2: the 111-test suite, Ruff, README command flow, platform-drift checks, and workflow YAML parsing pass; real CPython 3.15 compiled wheels built, repaired, validated, and imported on macOS arm64 and Linux aarch64. Native macOS x86_64 and Linux x86_64 builders were unavailable. actionlint and ultrareview are unavailable locally.
 2026-10-21 P3: all 25 repeated workflow measurements and the wheel-size run passed perf-gate-ready before and after each run; README plan median was 0.14 s (0.14–0.18), cached synthetic plan 0.14 s (0.13–0.17), with identical outcomes. The final wheel is 40,255 compressed bytes and 150,906 installed bytes; no focused loop exceeded 30 s or showed an actionable regression.
 2026-10-21 P4: manual review found and fixed staging-marker crash recovery; 14 focused regressions, all 113 tests, Ruff, the standalone loopback install, and the README flow pass. Core Python source is 4,036 lines. `ultrareview` was unavailable; native macOS x86_64 and Linux x86_64 builders remain untested.
+2026-10-21 follow-up closeout: corrected CI host fixtures and permissions, atomic inventory merge, complete local validation snapshots, wheel-to-sdist fallback, target-conditioned dependencies, prefix-safe index URLs, renderer migrations, native repair, and subprocess input/environment handling. Final local suite: 166 offline tests passed, one network resolver test passed, and both real integration tests passed on macOS arm64; an installed CPython 3.15 CLI completed resolve/add, plan, acquire, validate, publish, serve, and `uv pip install` for `requests[socks]`. The final follow-up tree has not run on the four CI runners; remote matrix proof remains pending. `actionlint` and `ultrareview` are unavailable locally.
 
 ## For the owner afterwards
 

@@ -17,6 +17,15 @@ from mypypi.models import (
 from mypypi.planner import ArtifactRecord, UpstreamSdist, UpstreamWheel, plan
 
 TARGET = Target(Version("3.15"), "linux-x86_64")
+CONFIGURED_TARGETS = tuple(
+    Target(Version("3.15"), platform)
+    for platform in (
+        "linux-x86_64",
+        "linux-aarch64",
+        "macos-x86_64",
+        "macos-arm64",
+    )
+)
 PACKAGE = PackageVersion.parse("demo-pkg", "1.0")
 WHEEL = WheelIdentity.parse("demo_pkg-1.0-py3-none-any.whl")
 
@@ -90,6 +99,53 @@ windows-x86_64 = "unsupported"
 ''')
     with pytest.raises(MypypiError, match="unsupported excluded platform"):
         plan(catalog, (TARGET,), {}, {})
+
+
+def test_linux_subset_accepts_exclusion_for_configured_macos_target():
+    catalog = parse_catalog('''
+[[packages]]
+name = "demo-pkg"
+version = "1.0"
+[packages.exclude_platforms]
+macos-arm64 = "upstream has no compatible source"
+''')
+    outcome = plan(
+        catalog,
+        (TARGET,),
+        {},
+        {
+            (PACKAGE, TARGET): (
+                UpstreamWheel(WHEEL, "https://files.example/demo.whl", "a" * 64),
+            )
+        },
+        configured_targets=CONFIGURED_TARGETS,
+    )
+    assert len(outcome) == 1
+    assert isinstance(outcome[0], DownloadWheel)
+    assert outcome[0].target == TARGET
+
+
+def test_plan_skips_targets_outside_pin_applicability():
+    catalog = parse_catalog('''
+[[packages]]
+name = "demo-pkg"
+version = "1.0"
+platforms = ["linux-x86_64"]
+''')
+    mac_target = Target(Version("3.15"), "macos-arm64")
+    outcomes = plan(
+        catalog,
+        (TARGET, mac_target),
+        {},
+        {
+            (PACKAGE, TARGET): (
+                UpstreamWheel(WHEEL, "https://files.example/demo.whl", "a" * 64),
+            )
+        },
+        configured_targets=CONFIGURED_TARGETS,
+    )
+    assert len(outcomes) == 1
+    assert outcomes[0].target == TARGET
 
 
 def test_plan_detects_filename_collision_with_different_bytes():

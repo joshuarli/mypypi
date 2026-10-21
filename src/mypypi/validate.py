@@ -3,24 +3,24 @@ from __future__ import annotations
 import csv
 import email.parser
 import hashlib
+import importlib.machinery
 import io
 import os
 import platform
 import re
-import shutil
 import subprocess
+import sys
 import tempfile
 import zipfile
 from base64 import urlsafe_b64encode
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from urllib.parse import urlsplit
 
 from packaging.requirements import InvalidRequirement, Requirement
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
 from packaging.tags import Tag, compatible_tags, cpython_tags, parse_tag
-from packaging.version import InvalidVersion
+from packaging.version import InvalidVersion, Version
 
 from .models import (
     ErrorKind,
@@ -32,6 +32,8 @@ from .models import (
     WheelIdentity,
 )
 from .platforms import native_architectures_from_bytes, target_platform_tags
+from .process_policy import redacted_diagnostic, run_process, uv_environment
+from .wheel_metadata import _matches_dist_info
 
 
 class ExceptionKind(StrEnum):
@@ -206,12 +208,7 @@ def _metadata_from_wheel(
             if len(dist_infos) != 1:
                 raise ValueError("wheel must contain exactly one .dist-info directory")
             dist_info = next(iter(dist_infos))
-            expected_dist_info = (
-                f"{identity.package.name.replace('-', '_')}-"
-                f"{str(identity.package.version).replace('-', '_').replace('+', '_')}"
-                ".dist-info"
-            )
-            if dist_info != expected_dist_info:
+            if not _matches_dist_info(identity, dist_info):
                 raise ValueError(
                     "wheel .dist-info directory does not match its filename"
                 )
@@ -226,9 +223,39 @@ def _metadata_from_wheel(
             wheel_headers = email.parser.BytesParser().parsebytes(
                 archive.read(wheel_path)
             )
+            metadata_versions = metadata.get_all("Metadata-Version", [])
+            metadata_names = metadata.get_all("Name", [])
+            metadata_package_versions = metadata.get_all("Version", [])
+            requires_python_values = metadata.get_all("Requires-Python", [])
+            wheel_versions = wheel_headers.get_all("Wheel-Version", [])
+            purelib_values = wheel_headers.get_all("Root-Is-Purelib", [])
+            generators = wheel_headers.get_all("Generator", [])
+            if (
+                len(metadata_versions) != 1
+                or len(metadata_names) != 1
+                or len(metadata_package_versions) != 1
+                or len(requires_python_values) > 1
+                or len(wheel_versions) != 1
+                or len(purelib_values) != 1
+                or not generators
+            ):
+                raise ValueError("wheel metadata contains missing or repeated singleton fields")
+            wheel_version = wheel_versions[0].split(".")
+            if (
+                len(wheel_version) != 2
+                or not all(part.isdecimal() for part in wheel_version)
+                or int(wheel_version[0]) != 1
+            ):
+                raise ValueError("wheel uses an unsupported WHEEL format version")
+            if purelib_values[0] not in {"true", "false"}:
+                raise ValueError("wheel Root-Is-Purelib must be true or false")
             try:
-                package = PackageVersion.parse(metadata["Name"], metadata["Version"])
-                requires_python = SpecifierSet(metadata.get("Requires-Python", ""))
+                package = PackageVersion.parse(
+                    metadata_names[0], metadata_package_versions[0]
+                )
+                requires_python = SpecifierSet(
+                    requires_python_values[0] if requires_python_values else ""
+                )
             except (TypeError, InvalidVersion, InvalidSpecifier) as error:
                 raise ValueError("wheel has invalid package metadata") from error
             if package != identity.package:
@@ -250,11 +277,18 @@ def _metadata_from_wheel(
             supported_tags = _supported_tags(target, linux_repair_policy)
             if not identity.tags.intersection(supported_tags):
                 raise ValueError("wheel filename tags are incompatible with target")
-            if not requires_python.contains(
-                str(target.python_version), prereleases=True
+            execution_version = target.python_version
+            if (
+                sys.implementation.name == "cpython"
+                and sys.version_info[:2] == tuple(target.python_version.release[:2])
+                and _local_platform() == target.platform
             ):
+                execution_version = Version(
+                    f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+                )
+            if not requires_python.contains(str(execution_version), prereleases=True):
                 raise ValueError(
-                    f"wheel Requires-Python excludes CPython {target.python_version}"
+                    f"wheel Requires-Python excludes CPython {execution_version}"
                 )
             rows = csv.reader(io.StringIO(archive.read(record_path).decode("utf-8")))
             recorded = {}
@@ -306,13 +340,35 @@ def _metadata_from_wheel(
                             f"native artifact {name} does not contain target "
                             f"architecture {expected_arch}"
                         )
-                if name.split("/", 1)[0].endswith(".dist-info") or ".data/" in name:
-                    continue
                 parts = name.split("/")
-                if len(parts) > 1 and parts[1] == "__init__.py":
-                    imports.add(parts[0])
-                elif len(parts) == 1 and name.endswith((".py", ".so", ".pyd")):
-                    imports.add(name.split(".", 1)[0])
+                if parts[0].endswith((".dist-info", ".data")):
+                    continue
+                if len(parts) > 1 and any(
+                    parts[-1].endswith(suffix)
+                    for suffix in (".py", *importlib.machinery.EXTENSION_SUFFIXES)
+                ):
+                    if parts[0].isidentifier():
+                        imports.add(parts[0])
+                elif len(parts) == 1:
+                    filename = parts[0]
+                    if filename.endswith(".py"):
+                        module = filename[:-3]
+                    else:
+                        suffix = next(
+                            (
+                                suffix
+                                for suffix in sorted(
+                                    importlib.machinery.EXTENSION_SUFFIXES,
+                                    key=len,
+                                    reverse=True,
+                                )
+                                if filename.endswith(suffix)
+                            ),
+                            None,
+                        )
+                        module = filename[: -len(suffix)] if suffix else ""
+                    if module.isidentifier():
+                        imports.add(module)
             return WheelMetadata(
                 identity,
                 requires_python,
@@ -349,32 +405,9 @@ def _install_command(
     python: Path,
     wheel: Path,
     wheel_set: Path,
-    index_url: str,
     policy: ValidationPolicy,
     uv: str = "uv",
 ) -> tuple[str, ...]:
-    parsed_index = urlsplit(index_url)
-    if (
-        parsed_index.scheme not in {"https", "http"}
-        or not parsed_index.netloc
-        or parsed_index.username is not None
-        or parsed_index.password is not None
-    ):
-        raise ValueError("curated runtime index must use HTTPS or loopback HTTP")
-    if parsed_index.scheme == "http" and parsed_index.hostname not in {
-        "127.0.0.1",
-        "::1",
-        "localhost",
-    }:
-        raise ValueError("curated runtime index must use HTTPS or loopback HTTP")
-    index_host = (parsed_index.hostname or "").rstrip(".").lower()
-    if (
-        index_host == "pypi.org"
-        or index_host.endswith(".pypi.org")
-        or index_host == "pythonhosted.org"
-        or index_host.endswith(".pythonhosted.org")
-    ):
-        raise ValueError("runtime validation cannot use the public PyPI index")
     install_target = str(wheel)
     if policy.extras:
         install_target += f"[{policy.extras}]"
@@ -385,9 +418,8 @@ def _install_command(
         "--no-config",
         "--no-cache",
         f"--python={python}",
+        "--no-index",
         "--only-binary=:all:",
-        f"--default-index={index_url}",
-        "--index-strategy=first-index",
         f"--find-links={wheel_set}",
         install_target,
         *policy.missing_dependencies,
@@ -395,17 +427,7 @@ def _install_command(
 
 
 def _uv_environment() -> dict[str, str]:
-    environment = os.environ.copy()
-    for variable in tuple(environment):
-        if (
-            variable in {"UV_INDEX", "UV_DEFAULT_INDEX"}
-            or variable.startswith(
-                ("UV_INDEX_", "UV_EXTRA_INDEX", "PIP_INDEX", "PIP_EXTRA_INDEX")
-            )
-            or variable in {"UV_FIND_LINKS", "PIP_FIND_LINKS", "UV_INDEX_STRATEGY"}
-        ):
-            environment.pop(variable)
-    return environment
+    return uv_environment()
 
 
 def _run_validation(
@@ -414,16 +436,18 @@ def _run_validation(
     wheel: Path,
     wheel_set: Path,
     target: Target,
-    index_url: str,
     policy: ValidationPolicy,
     uv: str = "uv",
 ) -> None:
-    python_executable = shutil.which(f"python{target.python_version}")
-    if python_executable is None:
+    if sys.implementation.name != "cpython" or sys.version_info[:2] != tuple(
+        target.python_version.release[:2]
+    ):
         raise _failure(
             metadata.identity,
             target,
-            f"CPython {target.python_version} is unavailable",
+            f"validation requires CPython {target.python_version}; current interpreter is "
+            f"{sys.implementation.name} {sys.version_info.major}.{sys.version_info.minor}."
+            f"{sys.version_info.micro}",
         )
     local_platform = _local_platform()
     if local_platform != target.platform:
@@ -434,20 +458,30 @@ def _run_validation(
             f"current runner is {local_platform or 'unsupported'}",
         )
     uv_environment = _uv_environment()
+    python_executable = str(Path(sys.executable).resolve())
 
-    def run(command: tuple[str, ...], stage: str) -> None:
+    def run(command: tuple[str, ...], stage: str, cwd: Path) -> None:
         try:
-            subprocess.run(
+            run_process(
                 command,
                 check=True,
                 capture_output=True,
                 text=True,
                 env=uv_environment,
+                cwd=cwd,
+                timeout=300,
             )
+        except subprocess.TimeoutExpired as cause:
+            raise _failure(
+                metadata.identity,
+                target,
+                f"{stage} timed out after 300 seconds",
+                cause=cause,
+            ) from cause
         except subprocess.CalledProcessError as cause:
             detail = f"{stage} failed for {wheel.name}"
             if cause.stderr:
-                detail = f"{detail}: {cause.stderr.strip()}"
+                detail = f"{detail}: {redacted_diagnostic(cause.stderr)}"
             raise _failure(
                 metadata.identity,
                 target,
@@ -457,7 +491,8 @@ def _run_validation(
 
     try:
         with tempfile.TemporaryDirectory(prefix="mypypi-validate-") as directory:
-            environment = Path(directory) / "venv"
+            neutral_directory = Path(directory).resolve()
+            environment = neutral_directory / "venv"
             run(
                 (
                     uv,
@@ -469,6 +504,7 @@ def _run_validation(
                     str(environment),
                 ),
                 "environment creation",
+                neutral_directory,
             )
             python = environment / (
                 "Scripts/python.exe" if os.name == "nt" else "bin/python"
@@ -477,17 +513,17 @@ def _run_validation(
                 python=python,
                 wheel=wheel,
                 wheel_set=wheel_set,
-                index_url=index_url,
                 policy=policy,
                 uv=uv,
             )
-            run(command, "dependency installation")
+            run(command, "dependency installation", neutral_directory)
             for import_name in metadata.imports:
                 if import_name in policy.skipped_imports:
                     continue
                 run(
-                    (str(python), "-c", f"__import__({import_name!r})"),
+                    (str(python), "-I", "-c", f"__import__({import_name!r})"),
                     f"import {import_name}",
+                    neutral_directory,
                 )
     except MypypiError:
         raise
@@ -497,7 +533,7 @@ def _run_validation(
             target,
             f"validation process failed: {cause}",
             cause=cause,
-        )
+        ) from cause
 
 
 def validate_wheel(
@@ -505,7 +541,6 @@ def validate_wheel(
     *,
     target: Target,
     wheel_set: Path,
-    index_url: str,
     policy: ValidationPolicy = ValidationPolicy(),
     uv: str = "uv",
     linux_repair_policy: str = "manylinux_2_28",
@@ -519,7 +554,6 @@ def validate_wheel(
             wheel=wheel,
             wheel_set=wheel_set,
             target=target,
-            index_url=index_url,
             policy=policy,
             uv=uv,
         )
@@ -539,7 +573,6 @@ def validate_wheels(
     *,
     targets: tuple[Target, ...],
     wheel_set: Path,
-    index_url: str,
     policies: dict[PackageVersion, ValidationPolicy] | None = None,
     uv: str = "uv",
     linux_repair_policy: str = "manylinux_2_28",
@@ -561,7 +594,6 @@ def validate_wheels(
                         wheel,
                         target=target,
                         wheel_set=wheel_set,
-                        index_url=index_url,
                         policy=policies.get(identity.package, ValidationPolicy()),
                         uv=uv,
                         linux_repair_policy=linux_repair_policy,

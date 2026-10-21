@@ -14,7 +14,8 @@ from packaging.specifiers import InvalidSpecifier, SpecifierSet
 from packaging.utils import canonicalize_name
 from packaging.version import Version
 
-from .models import ErrorKind, FailureContext, FailureStage, MypypiError, ValidatedArtifact
+from .models import ErrorKind, FailureContext, FailureStage, MypypiError, Target, ValidatedArtifact
+from .platforms import current_platform, target_python_version
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,9 +102,7 @@ def _wheel_metadata(artifact: ValidatedArtifact) -> tuple[str | None, bytes]:
             {
                 str(target.python_version)
                 for target in artifact.targets
-                if not specifier.contains(
-                    str(target.python_version), prereleases=True
-                )
+                if not _supports_target_python(specifier, target)
             }
         )
         if excluded_versions:
@@ -113,6 +112,29 @@ def _wheel_metadata(artifact: ValidatedArtifact) -> tuple[str | None, bytes]:
                 artifact,
             )
     return requires_python, metadata
+
+
+def _supports_target_python(specifier: SpecifierSet, target: Target) -> bool:
+    if current_platform() == target.platform:
+        return specifier.contains(
+            str(target_python_version(target)), prereleases=True
+        )
+    major, minor = target.python_version.release[:2]
+    candidates = {Version(f"{major}.{minor}.0"), Version(f"{major}.{minor}.1")}
+    for requirement in specifier:
+        try:
+            boundary = Version(requirement.version.removesuffix(".*"))
+        except ValueError:
+            continue
+        if boundary.release[:2] != (major, minor):
+            continue
+        patch = boundary.release[2] if len(boundary.release) > 2 else 0
+        candidates.update(
+            Version(f"{major}.{minor}.{value}")
+            for value in (patch - 1, patch, patch + 1)
+            if value >= 0
+        )
+    return any(specifier.contains(str(candidate), prereleases=True) for candidate in candidates)
 
 
 def prepare_index_artifacts(
@@ -171,11 +193,20 @@ def prepare_index_artifacts(
     )
 
 
-def render_project_page(artifacts: tuple[IndexArtifact, ...], wheel_prefix: str) -> bytes:
+def render_root_page(artifacts: tuple[IndexArtifact, ...]) -> bytes:
+    lines = ["<!DOCTYPE html>", "<html>", "  <body>"]
+    for name in sorted({project_name(item) for item in artifacts}):
+        href = quote(f"{name}/", safe="/-._~")
+        lines.append(f'    <a href="{html.escape(href, quote=True)}">{html.escape(name)}</a>')
+    lines.extend(["  </body>", "</html>", ""])
+    return "\n".join(lines).encode("utf-8")
+
+
+def render_project_page(artifacts: tuple[IndexArtifact, ...]) -> bytes:
     lines = ["<!DOCTYPE html>", "<html>", "  <body>"]
     for item in sorted(artifacts, key=lambda value: value.artifact.identity.filename):
         filename = item.artifact.identity.filename
-        href = quote(f"{wheel_prefix}/{filename}", safe="/-._~")
+        href = quote(f"../../wheels/{filename}", safe="/-._~")
         href += f"#sha256={item.artifact.sha256}"
         attributes = [f'href="{html.escape(href, quote=True)}"']
         if item.requires_python is not None:

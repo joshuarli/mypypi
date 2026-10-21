@@ -1,6 +1,8 @@
 import pytest
 
+from mypypi.build import validate_build_index
 from mypypi.cli import main
+from mypypi.models import MypypiError
 
 
 def test_help_lists_all_commands(capsys):
@@ -54,6 +56,40 @@ def test_strict_build_dependency_mode_requires_a_curated_index(capsys):
     assert status == 1
     diagnostic = capsys.readouterr().err
     assert "curated build dependency index" in diagnostic
+
+
+def test_build_index_accepts_loopback_and_file_sources_but_rejects_remote_http(tmp_path):
+    assert validate_build_index("http://127.0.0.1:8000/simple", strict=True)
+    assert validate_build_index((tmp_path / "simple").as_uri(), strict=True)
+    with pytest.raises(MypypiError, match="loopback HTTP"):
+        validate_build_index("http://packages.example/simple")
+
+
+def test_explicit_config_works_from_outside_the_repository(tmp_path, monkeypatch):
+    config = tmp_path / "project.toml"
+    config.write_text(
+        '[project]\nrequires-python = ">=3.15,<3.16"\n'
+        '[tool.mypypi.targets]\nplatforms = ["macos-arm64"]\n'
+        'linux_repair_policy = "manylinux_2_28"\n',
+        encoding="utf-8",
+    )
+    catalog = tmp_path / "packages.toml"
+    catalog.write_text("packages = []\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    assert main(
+        [
+            "--config",
+            str(config),
+            "--catalog",
+            str(catalog),
+            "plan",
+            "--output",
+            str(tmp_path / "index"),
+            "--platform",
+            "macos-arm64",
+        ]
+    ) == 0
 
 
 def test_keyboard_interrupt_returns_cancelled_status_without_traceback(

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,19 +11,11 @@ from .models import ErrorKind, FailureContext, FailureStage, MypypiError, Target
 
 
 @dataclass(frozen=True, slots=True)
-class BuilderImage:
-    platform: str
-    tag: str
-    digest: str
-
-
-@dataclass(frozen=True, slots=True)
 class ProjectSettings:
     python_specifier: SpecifierSet
     python_version: Version
     platforms: tuple[str, ...]
     linux_repair_policy: str
-    linux_builder_images: tuple[BuilderImage, ...]
 
     def targets(self) -> tuple[Target, ...]:
         return tuple(
@@ -74,9 +65,15 @@ def parse_project_settings(source: str) -> ProjectSettings:
         python_specifier = SpecifierSet(project["requires-python"])
         python_version = _python_minor(python_specifier)
         target_settings = document["tool"]["mypypi"]["targets"]
+        if not isinstance(target_settings, dict):
+            raise TypeError("target settings must be a table")
+        unknown = set(target_settings) - {"platforms", "linux_repair_policy"}
+        if unknown:
+            raise _configuration_error(
+                f"unknown target setting: {sorted(unknown)[0]}"
+            )
         raw_platforms = target_settings["platforms"]
         linux_repair_policy = target_settings["linux_repair_policy"]
-        raw_builder_images = target_settings["linux_builder_images"]
     except MypypiError:
         raise
     except (KeyError, TypeError, tomllib.TOMLDecodeError, ValueError) as cause:
@@ -94,52 +91,11 @@ def parse_project_settings(source: str) -> ProjectSettings:
         or linux_repair_policy.strip() != linux_repair_policy
     ):
         raise _configuration_error("Linux repair policy must be a non-empty name")
-    linux_platforms = tuple(
-        platform for platform in raw_platforms if platform.startswith("linux-")
-    )
-    if not isinstance(raw_builder_images, dict) or set(raw_builder_images) != set(
-        linux_platforms
-    ):
-        raise _configuration_error(
-            "Linux builder images must match the configured Linux targets"
-        )
-    builder_images = []
-    for platform_name in linux_platforms:
-        image = raw_builder_images[platform_name]
-        if not isinstance(image, dict) or set(image) != {"tag", "digest"}:
-            raise _configuration_error(
-                f"{platform_name} builder image requires only tag and digest"
-            )
-        tag = image["tag"]
-        digest = image["digest"]
-        architecture = platform_name.removeprefix("linux-")
-        repository, separator, image_tag = (
-            tag.rpartition(":") if isinstance(tag, str) else ("", "", "")
-        )
-        if (
-            not isinstance(tag, str)
-            or repository != f"quay.io/pypa/manylinux_2_28_{architecture}"
-            or not separator
-            or not image_tag
-            or any(character.isspace() for character in tag)
-            or "@" in tag
-        ):
-            raise _configuration_error(
-                f"{platform_name} builder image must retain its human-readable manylinux tag"
-            )
-        if not isinstance(digest, str) or re.fullmatch(
-            r"sha256:[0-9a-f]{64}", digest
-        ) is None:
-            raise _configuration_error(
-                f"{platform_name} builder image requires an immutable SHA-256 digest"
-            )
-        builder_images.append(BuilderImage(platform_name, tag, digest))
     return ProjectSettings(
         python_specifier=python_specifier,
         python_version=python_version,
         platforms=tuple(raw_platforms),
         linux_repair_policy=linux_repair_policy,
-        linux_builder_images=tuple(builder_images),
     )
 
 
