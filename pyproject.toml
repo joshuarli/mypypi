@@ -13,7 +13,7 @@ dependencies = ["packaging>=26.3"]
 mypypi = "mypypi.cli:main"
 
 [dependency-groups]
-dev = ["pytest>=9.1.1", "ruff>=0.17.1"]
+dev = ["pytest>=9.1.1", "ruff==0.17.2", "uv==0.13.5", "ty==0.0.91"]
 repair-linux = ["auditwheel>=6.8.2,<7; sys_platform == 'linux'"]
 repair-macos = ["delocate>=0.13,<0.14; sys_platform == 'darwin'"]
 
@@ -37,3 +37,6 @@ line-length = 120
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP"]
+
+[tool.ty.environment]
+python-version = "3.15"
