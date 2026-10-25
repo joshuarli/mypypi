@@ -323,7 +323,7 @@ def test_build_from_sdist_runs_custom_prebuild_without_a_shell(tmp_path, synthet
     assert Path(prebuild[2]).name == "prefix"
     assert options["cwd"] == Path.cwd()
     assert "shell" not in options
-    assert options["env"]["TMPDIR"].startswith(str(options["cwd"].parent))
+    assert options["env"]["TMPDIR"].startswith(str(tmp_path))
 
 
 def test_acquire_or_build_continues_across_sdist_compatibility_rejections(tmp_path, monkeypatch) -> None:
