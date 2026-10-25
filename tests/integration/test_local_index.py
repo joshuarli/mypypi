@@ -5,6 +5,7 @@ import io
 import os
 import shutil
 import subprocess
+import sys
 import threading
 import zipfile
 from base64 import urlsafe_b64encode
@@ -197,7 +198,7 @@ def test_uv_installs_from_local_index(tmp_path, monkeypatch):
                     "--no-config",
                     "--quiet",
                     "--python-preference=only-system",
-                    "--python=3.15",
+                    f"--python={sys.executable}",
                     str(consumer_path),
                 ),
                 check=True,
