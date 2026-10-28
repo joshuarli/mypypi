@@ -1,12 +1,11 @@
-name: Lint
+name: lint
 
 on:
-  push:
   pull_request:
-  workflow_dispatch:
+  push:
+    branches: [main, master]
 
-permissions:
-  contents: read
+permissions: {}
 
 concurrency:
   group: "${{ github.workflow }}-${{ github.head_ref || github.run_id }}"
@@ -17,18 +16,14 @@ defaults:
     shell: bash -euo pipefail {0}
 
 jobs:
-  ruff:
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15-intel, macos-15]
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
-        with:
-          version: 0.13.4
-      - run: uv python install 3.15
-      - run: uv sync --locked --python 3.15
-      - run: uv run --locked --python 3.15 ruff check src tests
+      - name: lint
+        run: make lint
