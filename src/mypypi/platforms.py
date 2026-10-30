@@ -39,14 +39,6 @@ def current_platform() -> str | None:
 
 
 def target_python_version(target: Target) -> Version:
-    if (
-        sys.implementation.name == "cpython"
-        and sys.version_info[:2] == tuple(target.python_version.release[:2])
-        and current_platform() == target.platform
-    ):
-        return Version(
-            f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
-        )
     major, minor = target.python_version.release[:2]
     return Version(f"{major}.{minor}.0")
 
